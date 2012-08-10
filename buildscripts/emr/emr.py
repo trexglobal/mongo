@@ -41,18 +41,18 @@ def _get_status():
 
 def _get_most_recent_tgz(prefix):
     # this is icky, but works for now
-    all = []
+    tgzs = []
     for x in os.listdir("."):
         if not x.startswith(prefix) or not x.endswith(".tgz"):
             continue
-        all.append((x, os.stat(x).st_mtime))
+        tgzs.append((x, os.stat(x).st_mtime))
 
-    if len(all) == 0:
+    if len(tgzs) == 0:
         raise Exception("can't find file with prefix: " + prefix)
 
-    all.sort(lambda x, y: int(y[1] - x[1]))
+    tgzs.sort(lambda x, y: int(y[1] - x[1]))
 
-    return all[0][0]
+    return tgzs[0][0]
 
 
 def get_build_info():
