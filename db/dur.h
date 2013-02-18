@@ -16,9 +16,9 @@ namespace mongo {
 
         // a smaller limit is likely better on 32 bit
 #if defined(__i386__) || defined(_M_IX86)
-        const unsigned UncommittedBytesLimit = 50 * 1024 * 1024;
+        const unsigned UncommittedBytesLimit = 256 * 1024 * 1024;
 #else
-        const unsigned UncommittedBytesLimit = 100 * 1024 * 1024;
+        const unsigned UncommittedBytesLimit = 512 * 1024 * 1024;
 #endif
 
         /** Call during startup so durability module can initialize
