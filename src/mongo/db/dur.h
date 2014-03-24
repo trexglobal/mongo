@@ -45,7 +45,7 @@ namespace mongo {
         void releasedWriteLock();
 
         // a smaller limit is likely better on 32 bit
-        const unsigned UncommittedBytesLimit = (sizeof(void*)==4) ? 50 * 1024 * 1024 : 100 * 1024 * 1024;
+        const unsigned UncommittedBytesLimit = (sizeof(void*)==4) ? 256 * 1024 * 1024 : 512 * 1024 * 1024;
 
         /** Call during startup so durability module can initialize
             Throws if fatal error
@@ -162,7 +162,7 @@ namespace mongo {
 
             /** Commits pending changes, flushes all changes to main data
                 files, then removes the journal.
-                
+
                 This is useful as a "barrier" to ensure that writes before this
                 call will never go through recovery and be applied to files
                 that have had changes made after this call applied.
