@@ -43,7 +43,7 @@ namespace mongo {
 /**
  * Maximum accepted message size on the wire protocol.
  */
-const size_t MaxMessageSizeBytes = 192 * 1000 * 1000;
+const size_t MaxMessageSizeBytes = 384 * 1000 * 1000;
 
 enum NetworkOp : int32_t {
     opInvalid = 0,
