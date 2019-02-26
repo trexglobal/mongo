@@ -15,7 +15,7 @@ import (
 const MsgHeaderLen = 16
 
 // MaxMessageSize is the maximum message size as defined in the server
-const MaxMessageSize = 48 * 1000 * 1000
+const MaxMessageSize = 384 * 1000 * 1000
 
 // MsgHeader is the mongo MessageHeader
 type MsgHeader struct {
