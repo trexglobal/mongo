@@ -155,7 +155,7 @@ private:
 class RecordStoreV1Base : public RecordStore {
 public:
     static const int Buckets = 26;
-    static const int MaxAllowedAllocation = 16 * 1024 * 1024 + 512 * 1024;
+    static const int MaxAllowedAllocation = 128 * 1024 * 1024 + 512 * 1024;
 
     static const int bucketSizes[];
 
