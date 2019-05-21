@@ -1,20 +1,31 @@
-#!/usr/bin/python
-
-#    Copyright 2012 10gen Inc.
+#!/usr/bin/env python3
 #
-#    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#    See the License for the specific language governing permissions and
-#    limitations under the License.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# Server Side Public License for more details.
 #
-
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 """Generate action_type.{h,cpp}
 
 Usage:
@@ -23,32 +34,45 @@ Usage:
 
 import sys
 
-
 headerFileTemplate = """// AUTO-GENERATED FILE DO NOT EDIT
 // See src/mongo/db/auth/generate_action_types.py
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
+#include <cstdint>
 #include <iosfwd>
 #include <map>
 #include <string>
 
 #include "mongo/base/status.h"
-#include "mongo/platform/cstdint.h"
 
 namespace mongo {
 
@@ -94,31 +118,45 @@ namespace mongo {
 
 sourceFileTemplate = """// AUTO-GENERATED FILE DO NOT EDIT
 // See src/mongo/db/auth/generate_action_types.py
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/action_type.h"
 
+#include <cstdint>
 #include <iostream>
 #include <string>
 
 #include "mongo/base/status.h"
-#include "mongo/platform/cstdint.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -139,9 +177,8 @@ namespace mongo {
     Status ActionType::parseActionFromString(const std::string& action, ActionType* result) {
 %(fromStringIfStatements)s
         return Status(ErrorCodes::FailedToParse,
-                      mongoutils::str::stream() << "Unrecognized action privilege string: "
-                                                << action,
-                      0);
+                      str::stream() << "Unrecognized action privilege string: "
+                                    << action);
     }
 
     // Takes an ActionType and returns the string representation
@@ -155,14 +192,14 @@ namespace mongo {
 } // namespace mongo
 """
 
+
 def writeSourceFile(actionTypes, sourceOutputFile):
     actionTypeConstants = ""
     fromStringIfStatements = ""
     toStringCaseStatements = ""
     for actionType in actionTypes:
         actionTypeConstants += ("    const ActionType ActionType::%(actionType)s"
-                                "(%(actionType)sValue);\n" %
-                                dict(actionType=actionType))
+                                "(%(actionType)sValue);\n" % dict(actionType=actionType))
         fromStringIfStatements += """        if (action == "%(actionType)s") {
             *result = %(actionType)s;
             return Status::OK();
@@ -176,6 +213,7 @@ def writeSourceFile(actionTypes, sourceOutputFile):
 
     pass
 
+
 def writeHeaderFile(actionTypes, headerOutputFile):
     actionTypeConstants = ""
     actionTypeIdentifiers = ""
@@ -186,6 +224,7 @@ def writeHeaderFile(actionTypes, headerOutputFile):
                                                     actionTypeIdentifiers=actionTypeIdentifiers)
     headerOutputFile.write(formattedHeaderFile)
 
+
 def hasDuplicateActionTypes(actionTypes):
     sortedActionTypes = sorted(actionTypes)
 
@@ -193,7 +232,7 @@ def hasDuplicateActionTypes(actionTypes):
     prevActionType = sortedActionTypes[0]
     for actionType in sortedActionTypes[1:]:
         if actionType == prevActionType:
-            print 'Duplicate actionType %s\n' % actionType
+            print('Duplicate actionType %s\n' % actionType)
             didFail = True
         prevActionType = actionType
 
@@ -206,7 +245,7 @@ def parseActionTypesFromFile(actionTypesFilename):
 
 if __name__ == "__main__":
     if len(sys.argv) != 4:
-        print "Usage: generate_action_types.py <path to action_types.txt> <header file path> <source file path>"
+        print("Usage: generate_action_types.py <path to action_types.txt> <header file path> <source file path>")
         sys.exit(-1)
 
     actionTypes = parseActionTypesFromFile(sys.argv[1])

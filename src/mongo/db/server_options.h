@@ -1,130 +1,269 @@
-/*    Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/util/net/listen.h" // For DEFAULT_MAX_CONN
+#include "mongo/stdx/variant.h"
+#include "mongo/util/net/cidr.h"
 
 namespace mongo {
 
-    struct ServerGlobalParams {
+const int DEFAULT_UNIX_PERMS = 0700;
+constexpr size_t DEFAULT_MAX_CONN = 1000000;
 
-        ServerGlobalParams() :
-            port(DefaultDBPort), rest(false), jsonp(false), indexBuildRetry(true), quiet(false),
-            configsvr(false), cpu(false), objcheck(true), defaultProfile(0),
-            slowMS(100), defaultLocalThresholdMillis(15), moveParanoia(true),
-            noUnixSocket(false), doFork(0), socket("/tmp"), maxConns(DEFAULT_MAX_CONN),
-            logAppend(false), logWithSyslog(false), isHttpInterfaceEnabled(false)
-        {
-            started = time(0);
-        }
+enum class ClusterRole { None, ShardServer, ConfigServer };
 
-        std::string binaryName;     // mongod or mongos
-        std::string cwd;            // cwd of when process started
+struct ServerGlobalParams {
+    std::string binaryName;  // mongod or mongos
+    std::string cwd;         // cwd of when process started
 
-        int port;              // --port
-        enum {
-            DefaultDBPort = 27017,
-            ConfigServerPort = 27019,
-            ShardServerPort = 27018
-        };
-        bool isDefaultPort() const { return port == DefaultDBPort; }
+    int port = DefaultDBPort;  // --port
+    enum { DefaultDBPort = 27017, ConfigServerPort = 27019, ShardServerPort = 27018 };
+    bool isDefaultPort() const {
+        return port == DefaultDBPort;
+    }
+    static std::string getPortSettingHelpText();
 
-        std::string bind_ip;        // --bind_ip
-        bool rest;             // --rest
-        bool jsonp;            // --jsonp
+    std::vector<std::string> bind_ips;  // --bind_ip
+    bool enableIPv6 = false;
+    bool rest = false;  // --rest
 
-        bool indexBuildRetry;  // --noIndexBuildRetry
+    int listenBacklog = 0;  // --listenBacklog, real default is SOMAXCONN
 
-        bool quiet;            // --quiet
+    AtomicWord<bool> quiet{false};  // --quiet
 
-        bool configsvr;        // --configsvr
+    ClusterRole clusterRole = ClusterRole::None;  // --configsvr/--shardsvr
 
-        bool cpu;              // --cpu show cpu time periodically
+    bool cpu = false;  // --cpu show cpu time periodically
 
-        bool objcheck;         // --objcheck
+    bool objcheck = true;  // --objcheck
 
-        int defaultProfile;    // --profile
-        int slowMS;            // --time in ms that is "slow"
-        int defaultLocalThresholdMillis;    // --localThreshold in ms to consider a node local
-        bool moveParanoia;     // for move chunk paranoia
+    int defaultProfile = 0;                // --profile
+    int slowMS = 100;                      // --time in ms that is "slow"
+    double sampleRate = 1.0;               // --samplerate rate at which to sample slow queries
+    int defaultLocalThresholdMillis = 15;  // --localThreshold in ms to consider a node local
+    bool moveParanoia = false;             // for move chunk paranoia
 
-        bool noUnixSocket;     // --nounixsocket
-        bool doFork;           // --fork
-        std::string socket;    // UNIX domain socket directory
+    bool noUnixSocket = false;    // --nounixsocket
+    bool doFork = false;          // --fork
+    std::string socket = "/tmp";  // UNIX domain socket directory
+    std::string transportLayer;   // --transportLayer (must be either "asio" or "legacy")
 
-        int maxConns;          // Maximum number of simultaneous open connections.
+    // --serviceExecutor ("adaptive", "synchronous")
+    std::string serviceExecutor;
 
-        std::string keyFile;   // Path to keyfile, or empty if none.
-        std::string pidFile;   // Path to pid file, or empty if none.
+    size_t maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
+    std::vector<stdx::variant<CIDR, std::string>> maxConnsOverride;
+    int reservedAdminThreads = 0;
 
-        std::string logpath;   // Path to log file, if logging to a file; otherwise, empty.
-        bool logAppend;        // True if logging to a file in append mode.
-        bool logWithSyslog;    // True if logging to syslog; must not be set if logpath is set.
-        int syslogFacility;    // Facility used when appending messages to the syslog.
+    int unixSocketPermissions = DEFAULT_UNIX_PERMS;  // permissions for the UNIX domain socket
 
-        bool isHttpInterfaceEnabled; // True if the dbwebserver should be enabled.
+    std::string keyFile;           // Path to keyfile, or empty if none.
+    std::string pidFile;           // Path to pid file, or empty if none.
+    std::string timeZoneInfoPath;  // Path to time zone info directory, or empty if none.
+
+    std::string logpath;            // Path to log file, if logging to a file; otherwise, empty.
+    bool logAppend = false;         // True if logging to a file in append mode.
+    bool logRenameOnRotate = true;  // True if logging should rename log files on rotate
+    bool logWithSyslog = false;     // True if logging to syslog; must not be set if logpath is set.
+    int syslogFacility;             // Facility used when appending messages to the syslog.
 
 #ifndef _WIN32
-        ProcessId parentProc;      // --fork pid of initial process
-        ProcessId leaderProc;      // --fork pid of leader process
+    ProcessId parentProc;  // --fork pid of initial process
+    ProcessId leaderProc;  // --fork pid of leader process
 #endif
 
+    /**
+     * Switches to enable experimental (unsupported) features.
+     */
+    struct ExperimentalFeatures {
+        ExperimentalFeatures() : storageDetailsCmdEnabled(false) {}
+        bool storageDetailsCmdEnabled;  // -- enableExperimentalStorageDetailsCmd
+    } experimental;
+
+    time_t started = ::time(0);
+
+    BSONArray argvArray;
+    BSONObj parsedOpts;
+
+    enum AuthState { kEnabled, kDisabled, kUndefined };
+
+    AuthState authState = AuthState::kUndefined;
+
+    bool transitionToAuth = false;    // --transitionToAuth, mixed mode for rolling auth upgrade
+    AtomicWord<int> clusterAuthMode;  // --clusterAuthMode, the internal cluster auth mode
+
+    enum ClusterAuthModes {
+        ClusterAuthMode_undefined,
         /**
-         * Switches to enable experimental (unsupported) features.
-         */
-        struct ExperimentalFeatures {
-            ExperimentalFeatures()
-                : indexStatsCmdEnabled(false)
-                , storageDetailsCmdEnabled(false)
-            {}
-            bool indexStatsCmdEnabled; // -- enableExperimentalIndexStatsCmd
-            bool storageDetailsCmdEnabled; // -- enableExperimentalStorageDetailsCmd
-        } experimental;
+        * Authenticate using keyfile, accept only keyfiles
+        */
+        ClusterAuthMode_keyFile,
 
-        time_t started;
+        /**
+        * Authenticate using keyfile, accept both keyfiles and X.509
+        */
+        ClusterAuthMode_sendKeyFile,
 
-        BSONArray argvArray;
-        BSONObj parsedOpts;
-        AtomicInt32 clusterAuthMode;    // --clusterAuthMode, the internal cluster auth mode
+        /**
+        * Authenticate using X.509, accept both keyfiles and X.509
+        */
+        ClusterAuthMode_sendX509,
 
-        enum ClusterAuthModes {
-            ClusterAuthMode_undefined,
-            /** 
-            * Authenticate using keyfile, accept only keyfiles
-            */
-            ClusterAuthMode_keyFile,
-
-            /**
-            * Authenticate using keyfile, accept both keyfiles and X.509
-            */
-            ClusterAuthMode_sendKeyFile,
-
-            /**
-            * Authenticate using X.509, accept both keyfiles and X.509
-            */
-            ClusterAuthMode_sendX509,
-
-            /**
-            * Authenticate using X.509, accept only X.509
-            */
-            ClusterAuthMode_x509
-        };
+        /**
+        * Authenticate using X.509, accept only X.509
+        */
+        ClusterAuthMode_x509
     };
 
-    extern ServerGlobalParams serverGlobalParams;
+    // for the YAML config, sharding._overrideShardIdentity. Can only be used when in
+    // queryableBackupMode.
+    BSONObj overrideShardIdentity;
+
+    struct FeatureCompatibility {
+        /**
+         * The combination of the fields (version, targetVersion) in the featureCompatiiblityVersion
+         * document in the server configuration collection (admin.system.version) are represented by
+         * this enum and determine this node's behavior.
+         *
+         * Features can be gated for specific versions, or ranges of versions above or below some
+         * minimum or maximum version, respectively.
+         *
+         * The legal enum (and featureCompatibilityVersion document) states are:
+         *
+         * kFullyDowngradedTo40
+         * (4.0, Unset): Only 4.0 features are available, and new and existing storage
+         *               engine entries use the 4.0 format
+         *
+         * kUpgradingTo42
+         * (4.0, 4.2): Only 4.0 features are available, but new storage engine entries
+         *             use the 4.2 format, and existing entries may have either the
+         *             4.0 or 4.2 format
+         *
+         * kFullyUpgradedTo42
+         * (4.2, Unset): 4.2 features are available, and new and existing storage
+         *               engine entries use the 4.2 format
+         *
+         * kDowngradingTo40
+         * (4.0, 4.0): Only 4.0 features are available and new storage engine
+         *             entries use the 4.0 format, but existing entries may have
+         *             either the 4.0 or 4.2 format
+         *
+         * kUnsetDefault40Behavior
+         * (Unset, Unset): This is the case on startup before the fCV document is
+         *                 loaded into memory. isVersionInitialized() will return
+         *                 false, and getVersion() will return the default
+         *                 (kFullyDowngradedTo40).
+         *
+         */
+        enum class Version {
+            // The order of these enums matter, higher upgrades having higher values, so that
+            // features can be active or inactive if the version is higher than some minimum or
+            // lower than some maximum, respectively.
+            kUnsetDefault40Behavior = 0,
+            kFullyDowngradedTo40 = 1,
+            kDowngradingTo40 = 2,
+            kUpgradingTo42 = 3,
+            kFullyUpgradedTo42 = 4,
+        };
+
+        /**
+         * On startup, the featureCompatibilityVersion may not have been explicitly set yet. This
+         * exposes the actual state of the featureCompatibilityVersion if it is uninitialized.
+         */
+        const bool isVersionInitialized() const {
+            return _version.load() != Version::kUnsetDefault40Behavior;
+        }
+
+        /**
+         * This safe getter for the featureCompatibilityVersion parameter ensures the parameter has
+         * been initialized with a meaningful value.
+         */
+        const Version getVersion() const {
+            invariant(isVersionInitialized());
+            return _version.load();
+        }
+
+        /**
+         * This unsafe getter for the featureCompatibilityVersion parameter returns the last-stable
+         * featureCompatibilityVersion value if the parameter has not yet been initialized with a
+         * meaningful value. This getter should only be used if the parameter is intentionally read
+         * prior to the creation/parsing of the featureCompatibilityVersion document.
+         */
+        const Version getVersionUnsafe() const {
+            Version v = _version.load();
+            return (v == Version::kUnsetDefault40Behavior) ? Version::kFullyDowngradedTo40 : v;
+        }
+
+        void reset() {
+            _version.store(Version::kUnsetDefault40Behavior);
+        }
+
+        void setVersion(Version version) {
+            return _version.store(version);
+        }
+
+        bool isVersionUpgradingOrUpgraded() {
+            return (getVersion() == Version::kUpgradingTo42 ||
+                    getVersion() == Version::kFullyUpgradedTo42);
+        }
+
+    private:
+        AtomicWord<Version> _version{Version::kUnsetDefault40Behavior};
+
+    } featureCompatibility;
+
+    // Feature validation differs depending on the role of a mongod in a replica set. Replica set
+    // primaries can accept user-initiated writes and validate based on the feature compatibility
+    // version. A secondary always validates in the upgraded mode so that it can sync new features,
+    // even when in the downgraded feature compatibility mode.
+    AtomicWord<bool> validateFeaturesAsMaster{true};
+
+    std::vector<std::string> disabledSecureAllocatorDomains;
+
+    bool enableMajorityReadConcern = true;
+};
+
+extern ServerGlobalParams serverGlobalParams;
+
+template <typename NameTrait>
+struct TraitNamedDomain {
+    static bool peg() {
+        const auto& dsmd = serverGlobalParams.disabledSecureAllocatorDomains;
+        const auto contains = [&](StringData dt) {
+            return std::find(dsmd.begin(), dsmd.end(), dt) != dsmd.end();
+        };
+        static const bool ret = !(contains("*"_sd) || contains(NameTrait::DomainType));
+        return ret;
+    }
+};
 }

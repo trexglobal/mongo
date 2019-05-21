@@ -1,120 +1,135 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
 #include <string>
 #include <vector>
 
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/dbtests/mock/mock_remote_db_server.h"
 
 namespace mongo {
+/**
+ * A simple class for mocking mongo::DBClientConnection.
+ *
+ * Also check out sample usage in dbtests/mock_dbclient_conn_test.cpp
+ */
+class MockDBClientConnection : public mongo::DBClientConnection {
+public:
     /**
-     * A simple class for mocking mongo::DBClientConnection.
+     * Create a mock connection to a mock server.
      *
-     * Also check out sample usage in dbtests/mock_dbclient_conn_test.cpp
+     * @param remoteServer the remote server to connect to. The caller is
+     *     responsible for making sure that the life of remoteServer is
+     *     longer than this connection.
+     * @param autoReconnect will automatically re-establish connection the
+     *     next time an operation is requested when the last operation caused
+     *     this connection to fall into a failed state.
      */
-    class MockDBClientConnection : public mongo::DBClientConnection {
-    public:
-        /**
-         * Create a mock connection to a mock server.
-         *
-         * @param remoteServer the remote server to connect to. The caller is
-         *     responsible for making sure that the life of remoteServer is
-         *     longer than this connection.
-         * @param autoReconnect will automatically re-establish connection the
-         *     next time an operation is requested when the last operation caused
-         *     this connection to fall into a failed state.
-         */
-        MockDBClientConnection(MockRemoteDBServer* remoteServer, bool autoReconnect = false);
-        virtual ~MockDBClientConnection();
+    MockDBClientConnection(MockRemoteDBServer* remoteServer, bool autoReconnect = false);
+    virtual ~MockDBClientConnection();
 
-        //
-        // DBClientBase methods
-        //
+    //
+    // DBClientBase methods
+    //
+    using DBClientBase::query;
 
-        bool connect(const char* hostName, std::string& errmsg);
+    bool connect(const char* hostName, StringData applicationName, std::string& errmsg);
 
-        inline bool connect(const HostAndPort& host, std::string& errmsg) {
-            return connect(host.toString().c_str(), errmsg);
+    Status connect(const HostAndPort& host, StringData applicationName) override {
+        std::string errmsg;
+        if (!connect(host.toString().c_str(), applicationName, errmsg)) {
+            return {ErrorCodes::HostNotFound, errmsg};
         }
+        return Status::OK();
+    }
 
-        bool runCommand(const std::string& dbname, const mongo::BSONObj& cmdObj,
-                mongo::BSONObj &info, int options = 0);
+    using DBClientBase::runCommandWithTarget;
+    std::pair<rpc::UniqueReply, DBClientBase*> runCommandWithTarget(OpMsgRequest request) override;
 
-        std::auto_ptr<mongo::DBClientCursor> query(const std::string &ns,
-                mongo::Query query = mongo::Query(),
-                int nToReturn = 0,
-                int nToSkip = 0,
-                const mongo::BSONObj* fieldsToReturn = 0,
-                int queryOptions = 0,
-                int batchSize = 0);
+    std::unique_ptr<mongo::DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
+                                                 mongo::Query query = mongo::Query(),
+                                                 int nToReturn = 0,
+                                                 int nToSkip = 0,
+                                                 const mongo::BSONObj* fieldsToReturn = 0,
+                                                 int queryOptions = 0,
+                                                 int batchSize = 0) override;
 
-        uint64_t getSockCreationMicroSec() const;
+    uint64_t getSockCreationMicroSec() const override;
 
-        virtual void insert(const string& ns, BSONObj obj, int flags = 0);
+    void insert(const std::string& ns, BSONObj obj, int flags = 0) override;
 
-        virtual void insert(const string& ns, const vector<BSONObj>& objList, int flags = 0);
+    void insert(const std::string& ns, const std::vector<BSONObj>& objList, int flags = 0) override;
 
-        virtual void remove(const string& ns, Query query, bool justOne = false);
+    void remove(const std::string& ns, Query query, int flags = 0) override;
 
-        virtual void remove(const string& ns, Query query, int flags = 0);
+    //
+    // Getters
+    //
 
-        //
-        // Getters
-        //
+    mongo::ConnectionString::ConnectionType type() const override;
+    bool isFailed() const override;
+    double getSoTimeout() const override;
+    std::string getServerAddress() const override;
+    std::string toString() const override;
 
-        mongo::ConnectionString::ConnectionType type() const;
-        bool isFailed() const;
-        double getSoTimeout() const;
-        std::string getServerAddress() const;
-        std::string toString() const;
+    //
+    // Unsupported methods (defined to get rid of virtual function was hidden error)
+    //
 
-        //
-        // Unsupported methods (defined to get rid of virtual function was hidden error)
-        //
-        unsigned long long query(boost::function<void(const mongo::BSONObj&)> f,
-                const std::string& ns, mongo::Query query,
-                const mongo::BSONObj* fieldsToReturn = 0, int queryOptions = 0);
+    unsigned long long query(stdx::function<void(mongo::DBClientCursorBatchIterator&)> f,
+                             const NamespaceStringOrUUID& nsOrUuid,
+                             mongo::Query query,
+                             const mongo::BSONObj* fieldsToReturn = 0,
+                             int queryOptions = 0,
+                             int batchSize = 0) override;
 
-        unsigned long long query(boost::function<void(mongo::DBClientCursorBatchIterator&)> f,
-                const std::string& ns, mongo::Query query,
-                const mongo::BSONObj* fieldsToReturn = 0,
-                int queryOptions = 0);
+    //
+    // Unsupported methods (these are pure virtuals in the base class)
+    //
 
-        //
-        // Unsupported methods (these are pure virtuals in the base class)
-        //
+    void killCursor(const NamespaceString& ns, long long cursorID) override;
+    bool call(mongo::Message& toSend,
+              mongo::Message& response,
+              bool assertOk,
+              std::string* actualServer) override;
+    void say(mongo::Message& toSend, bool isRetry = false, std::string* actualServer = 0) override;
+    bool lazySupported() const override;
 
-        void killCursor(long long cursorID);
-        bool callRead(mongo::Message& toSend , mongo::Message& response);
-        bool call(mongo::Message& toSend, mongo::Message& response, bool assertOk = true,
-                std::string* actualServer = 0);
-        void say(mongo::Message& toSend, bool isRetry = false, std::string* actualServer = 0);
-        void sayPiggyBack(mongo::Message& toSend);
-        bool lazySupported() const;
+private:
+    void checkConnection() override;
 
-    private:
-        void checkConnection();
-
-        MockRemoteDBServer::InstanceID _remoteServerInstanceID;
-        MockRemoteDBServer* _remoteServer;
-        bool _isFailed;
-        uint64_t _sockCreationTime;
-        bool _autoReconnect;
-    };
+    MockRemoteDBServer::InstanceID _remoteServerInstanceID;
+    MockRemoteDBServer* _remoteServer;
+    bool _isFailed;
+    uint64_t _sockCreationTime;
+    bool _autoReconnect;
+};
 }

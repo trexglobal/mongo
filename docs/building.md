@@ -1,74 +1,102 @@
 Building MongoDB
 ================
 
-SCONS
+To build MongoDB, you will need:
+
+* A modern C++ compiler capable of compiling C++17. One of the following is required:
+    * GCC 8.0 or newer
+    * Clang 7.0 (or Apple XCode 10.0 Clang) or newer
+    * Visual Studio 2017 version 15.9 or newer (See Windows section below for details)
+* On Linux and macOS, the libcurl library and header is required. MacOS includes libcurl.
+    * Fedora/RHEL - `dnf install libcurl-devel`
+    * Ubuntu/Debian - `apt-get install libcurl-dev`
+* Python 3.7.x and Pip modules:
+  * See the section "Python Prerequisites" below.
+
+MongoDB supports the following architectures: arm64, ppc64le, s390x, and x86-64.
+More detailed platform instructions can be found below.
+
+
+MongoDB Tools
+--------------
+
+The MongoDB command line tools (mongodump, mongorestore, mongoimport, mongoexport, etc)
+have been rewritten in [Go](http://golang.org/) and are no longer included in this repository.
+
+The source for the tools is now available at [mongodb/mongo-tools](https://github.com/mongodb/mongo-tools).
+
+Python Prerequisites
 ---------------
 
-For detail information about building, please see [the manual](http://dochub.mongodb.org/core/building).
+In order to build MongoDB, Python 3.7.x is required, and several Python modules. To install
+the required Python modules, run:
 
-If you want to build everything (mongod, mongo, tools, etc):
+    $ pip3 install -r etc/pip/compile-requirements.txt
 
-    $ scons all
+Note: If the `pip3` command is not available, `pip` without a suffix may be the pip command
+associated with Python 3.7.x.
+
+SCons
+---------------
+
+For detail information about building, please see [the build manual](https://github.com/mongodb/mongo/wiki/Build-Mongodb-From-Source)
+
+If you want to build everything (mongod, mongo, tests, etc):
+
+    $ python3 buildscripts/scons.py all
 
 If you only want to build the database:
 
-    $ scons
+    $ python3 buildscripts/scons.py mongod
+
+***Note***: For C++ compilers that are newer than the supported version, the compiler may issue new warnings that cause MongoDB to fail to build since the build system treats compiler warnings as errors. To ignore the warnings, pass the switch `--disable-warnings-as-errors` to scons.
+
+    $ python3 buildscripts/scons.py mongod --disable-warnings-as-errors
 
 To install
 
-    $ scons --prefix=/opt/mongo install
+    $ python3 buildscripts/scons.py --prefix=/opt/mongo install
 
 Please note that prebuilt binaries are available on [mongodb.org](http://www.mongodb.org/downloads) and may be the easiest way to get started.
 
-SCONS TARGETS
+SCons Targets
 --------------
+
+The following targets can be named on the scons command line to build only certain components:
 
 * mongod
 * mongos
 * mongo
-* mongoclient
+* core (includes mongod, mongos, mongo)
 * all
 
-COMPILER VERSIONS
+Windows
 --------------
 
-Mongo has been tested with GCC 4.x and Visual Studio 2008 and 2010.  Older versions
-of GCC may not be happy.
-
-WINDOWS
---------------
-
-See http://dochub.mongodb.org/core/buildingforwindows
+See [the windows build manual](https://github.com/mongodb/mongo/wiki/Build-Mongodb-From-Source#windows-specific-instructions)
 
 Build requirements:
-* vc++ express or visual studio
-* python 2.5 (for scons - 2.6 might be needed for some regression tests)
-* scons
-* boost 1.35 (or higher)
+* Visual Studio 2017 version 15.9 or newer
+* Python 3.7
 
 Or download a prebuilt binary for Windows at www.mongodb.org.
 
-UBUNTU
+Debian/Ubuntu
 --------------
 
-To install dependencies on Ubuntu systems:
+To install dependencies on Debian or Ubuntu systems:
 
-    # aptitude install scons build-essential
+    # aptitude install build-essential
     # aptitude install libboost-filesystem-dev libboost-program-options-dev libboost-system-dev libboost-thread-dev
 
 To run tests as well, you will need PyMongo:
 
     # aptitude install python-pymongo
 
-Then build as usual with `scons`:
-
-    $ scons all
-
-
 OS X
 --------------
 
-Using [Homebrew](http://mxcl.github.com/homebrew/):
+Using [Homebrew](http://brew.sh):
 
     $ brew install mongodb
 
@@ -76,19 +104,27 @@ Using [MacPorts](http://www.macports.org):
 
     $ sudo port install mongodb
 
-FREEBSD
+FreeBSD
 --------------
 
 Install the following ports:
 
-  * devel/boost
   * devel/libexecinfo
+  * lang/llvm70
+  * lang/python
+
+Optional Components if you want to use system libraries instead of the libraries included with MongoDB
+
+  * archivers/snappy
+  * devel/boost
   * devel/pcre
-  * lang/spidermonkey
 
+Add `CC=clang70 CXX=clang++70` to the `scons` options, when building.
 
-Special Build Notes
+OpenBSD
 --------------
-  * [debian etch on ec2](building.debian.etch.ec2.html)
-  * [open solaris on ec2](building.opensolaris.ec2.html)
+Install the following ports:
 
+  * devel/libexecinfo
+  * lang/gcc
+  * lang/python

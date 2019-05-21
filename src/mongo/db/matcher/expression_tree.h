@@ -1,25 +1,24 @@
-// expression_tree.h
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,7 +31,6 @@
 
 #include "mongo/db/matcher/expression.h"
 
-#include <boost/scoped_ptr.hpp>
 
 /**
  * this contains all Expessions that define the structure of the tree
@@ -40,147 +38,214 @@
  */
 namespace mongo {
 
-    class ListOfMatchExpression : public MatchExpression {
-    public:
-        ListOfMatchExpression( MatchType type ) : MatchExpression( type ){}
-        virtual ~ListOfMatchExpression();
+class ListOfMatchExpression : public MatchExpression {
+public:
+    explicit ListOfMatchExpression(MatchType type) : MatchExpression(type) {}
+    virtual ~ListOfMatchExpression();
 
-        /**
-         * @param e - I take ownership
-         */
-        void add( MatchExpression* e );
+    /**
+     * @param e - I take ownership
+     */
+    void add(MatchExpression* e);
 
-        /**
-         * clears all the thingsd we own, and does NOT delete
-         * someone else has taken ownership
-         */
-        void clearAndRelease() { _expressions.clear(); }
+    /**
+     * clears all the thingsd we own, and does NOT delete
+     * someone else has taken ownership
+     */
+    void clearAndRelease() {
+        _expressions.clear();
+    }
 
-        virtual size_t numChildren() const { return _expressions.size(); }
+    virtual size_t numChildren() const {
+        return _expressions.size();
+    }
 
-        virtual MatchExpression* getChild( size_t i ) const { return _expressions[i]; }
+    virtual MatchExpression* getChild(size_t i) const {
+        return _expressions[i];
+    }
 
-        virtual std::vector<MatchExpression*>* getChildVector() { return &_expressions; }
+    /*
+     * Replaces the ith child with nullptr, and releases ownership of the child.
+     */
+    virtual std::unique_ptr<MatchExpression> releaseChild(size_t i) {
+        auto child = std::unique_ptr<MatchExpression>(_expressions[i]);
+        _expressions[i] = nullptr;
+        return child;
+    }
 
-        bool equivalent( const MatchExpression* other ) const;
+    /*
+     * Removes the ith child, and releases ownership of the child.
+     */
+    virtual std::unique_ptr<MatchExpression> removeChild(size_t i) {
+        auto child = std::unique_ptr<MatchExpression>(_expressions[i]);
+        _expressions.erase(_expressions.begin() + i);
+        return child;
+    }
 
-    protected:
-        void _debugList( StringBuilder& debug, int level ) const;
+    virtual std::vector<MatchExpression*>* getChildVector() {
+        return &_expressions;
+    }
 
-    private:
-        std::vector< MatchExpression* > _expressions;
-    };
+    bool equivalent(const MatchExpression* other) const;
 
-    class AndMatchExpression : public ListOfMatchExpression {
-    public:
-        AndMatchExpression() : ListOfMatchExpression( AND ){}
-        virtual ~AndMatchExpression(){}
+    MatchCategory getCategory() const final {
+        return MatchCategory::kLogical;
+    }
 
-        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
-        virtual bool matchesSingleElement( const BSONElement& e ) const;
+protected:
+    void _debugList(StringBuilder& debug, int indentationLevel) const;
 
-        virtual MatchExpression* shallowClone() const {
-            AndMatchExpression* self = new AndMatchExpression();
-            for (size_t i = 0; i < numChildren(); ++i) {
-                self->add(getChild(i)->shallowClone());
-            }
-            if ( getTag() ) {
-                self->setTag(getTag()->clone());
-            }
-            return self;
+    void _listToBSON(BSONArrayBuilder* out) const;
+
+private:
+    ExpressionOptimizerFunc getOptimizer() const final;
+
+    std::vector<MatchExpression*> _expressions;
+};
+
+class AndMatchExpression : public ListOfMatchExpression {
+public:
+    static constexpr StringData kName = "$and"_sd;
+
+    AndMatchExpression() : ListOfMatchExpression(AND) {}
+    virtual ~AndMatchExpression() {}
+
+    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const;
+
+    bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
+
+    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+        std::unique_ptr<AndMatchExpression> self = stdx::make_unique<AndMatchExpression>();
+        for (size_t i = 0; i < numChildren(); ++i) {
+            self->add(getChild(i)->shallowClone().release());
         }
-
-        virtual void debugString( StringBuilder& debug, int level = 0 ) const;
-    };
-
-    class OrMatchExpression : public ListOfMatchExpression {
-    public:
-        OrMatchExpression() : ListOfMatchExpression( OR ){}
-        virtual ~OrMatchExpression(){}
-
-        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
-        virtual bool matchesSingleElement( const BSONElement& e ) const;
-
-        virtual MatchExpression* shallowClone() const {
-            OrMatchExpression* self = new OrMatchExpression();
-            for (size_t i = 0; i < numChildren(); ++i) {
-                self->add(getChild(i)->shallowClone());
-            }
-            if ( getTag() ) {
-                self->setTag(getTag()->clone());
-            }
-            return self;
+        if (getTag()) {
+            self->setTag(getTag()->clone());
         }
+        return std::move(self);
+    }
 
-        virtual void debugString( StringBuilder& debug, int level = 0 ) const;
-    };
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-    class NorMatchExpression : public ListOfMatchExpression {
-    public:
-        NorMatchExpression() : ListOfMatchExpression( NOR ){}
-        virtual ~NorMatchExpression(){}
+    virtual void serialize(BSONObjBuilder* out) const;
 
-        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
-        virtual bool matchesSingleElement( const BSONElement& e ) const;
+    bool isTriviallyTrue() const final;
+};
 
-        virtual MatchExpression* shallowClone() const {
-            NorMatchExpression* self = new NorMatchExpression();
-            for (size_t i = 0; i < numChildren(); ++i) {
-                self->add(getChild(i)->shallowClone());
-            }
-            if ( getTag() ) {
-                self->setTag(getTag()->clone());
-            }
-            return self;
+class OrMatchExpression : public ListOfMatchExpression {
+public:
+    static constexpr StringData kName = "$or"_sd;
+
+    OrMatchExpression() : ListOfMatchExpression(OR) {}
+    virtual ~OrMatchExpression() {}
+
+    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const;
+
+    bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
+
+    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+        std::unique_ptr<OrMatchExpression> self = stdx::make_unique<OrMatchExpression>();
+        for (size_t i = 0; i < numChildren(); ++i) {
+            self->add(getChild(i)->shallowClone().release());
         }
-
-        virtual void debugString( StringBuilder& debug, int level = 0 ) const;
-    };
-
-    class NotMatchExpression : public MatchExpression {
-    public:
-        NotMatchExpression() : MatchExpression( NOT ){}
-        NotMatchExpression( MatchExpression* e ) : MatchExpression( NOT ), _exp( e ){}
-        /**
-         * @param exp - I own it, and will delete
-         */
-        virtual Status init( MatchExpression* exp ) {
-            _exp.reset( exp );
-            return Status::OK();
+        if (getTag()) {
+            self->setTag(getTag()->clone());
         }
+        return std::move(self);
+    }
 
-        virtual MatchExpression* shallowClone() const {
-            NotMatchExpression* self = new NotMatchExpression();
-            MatchExpression* child = _exp->shallowClone();
-            self->init(child);
-            if ( getTag() ) {
-                self->setTag(getTag()->clone());
-            }
-            return self;
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
+
+    virtual void serialize(BSONObjBuilder* out) const;
+
+    bool isTriviallyFalse() const final;
+};
+
+class NorMatchExpression : public ListOfMatchExpression {
+public:
+    static constexpr StringData kName = "$nor"_sd;
+
+    NorMatchExpression() : ListOfMatchExpression(NOR) {}
+    virtual ~NorMatchExpression() {}
+
+    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const;
+
+    bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
+
+    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+        std::unique_ptr<NorMatchExpression> self = stdx::make_unique<NorMatchExpression>();
+        for (size_t i = 0; i < numChildren(); ++i) {
+            self->add(getChild(i)->shallowClone().release());
         }
-
-        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const {
-            return !_exp->matches( doc, NULL );
+        if (getTag()) {
+            self->setTag(getTag()->clone());
         }
+        return std::move(self);
+    }
 
-        virtual bool matchesSingleElement( const BSONElement& e ) const {
-            return !_exp->matchesSingleElement( e );
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
+
+    virtual void serialize(BSONObjBuilder* out) const;
+};
+
+class NotMatchExpression final : public MatchExpression {
+public:
+    explicit NotMatchExpression(MatchExpression* e) : MatchExpression(NOT), _exp(e) {}
+
+    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+        std::unique_ptr<NotMatchExpression> self =
+            stdx::make_unique<NotMatchExpression>(_exp->shallowClone().release());
+        if (getTag()) {
+            self->setTag(getTag()->clone());
         }
+        return std::move(self);
+    }
 
-        virtual void debugString( StringBuilder& debug, int level = 0 ) const;
+    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const {
+        return !_exp->matches(doc, NULL);
+    }
 
-        bool equivalent( const MatchExpression* other ) const;
+    bool matchesSingleElement(const BSONElement& elt, MatchDetails* details = nullptr) const final {
+        return !_exp->matchesSingleElement(elt, details);
+    }
 
-        virtual size_t numChildren() const { return 1; }
+    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-        virtual MatchExpression* getChild( size_t i ) const { return _exp.get(); }
+    virtual void serialize(BSONObjBuilder* out) const;
 
-        MatchExpression* releaseChild(void) { return _exp.release(); }
+    bool equivalent(const MatchExpression* other) const;
 
-        void resetChild( MatchExpression* newChild) { _exp.reset(newChild); }
+    size_t numChildren() const final {
+        return 1;
+    }
 
-    private:
-        std::auto_ptr<MatchExpression> _exp;
-    };
+    MatchExpression* getChild(size_t i) const final {
+        return _exp.get();
+    }
 
+    std::vector<MatchExpression*>* getChildVector() final {
+        return nullptr;
+    }
+
+    MatchExpression* releaseChild(void) {
+        return _exp.release();
+    }
+
+    void resetChild(MatchExpression* newChild) {
+        _exp.reset(newChild);
+    }
+
+    MatchCategory getCategory() const final {
+        return MatchCategory::kLogical;
+    }
+
+private:
+    static boost::optional<StringData> getPathIfNotWithSinglePathMatchExpressionTree(
+        MatchExpression* exp);
+    static void serializeNotExpressionToNor(MatchExpression* exp, BSONObjBuilder* out);
+
+    ExpressionOptimizerFunc getOptimizer() const final;
+
+    std::unique_ptr<MatchExpression> _exp;
+};
 }

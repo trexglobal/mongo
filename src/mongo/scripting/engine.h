@@ -1,250 +1,282 @@
-// engine.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
-    typedef unsigned long long ScriptingFunction;
-    typedef BSONObj (*NativeFunction)(const BSONObj& args, void* data);
-    typedef map<string, ScriptingFunction> FunctionCacheMap;
+typedef unsigned long long ScriptingFunction;
+typedef BSONObj (*NativeFunction)(const BSONObj& args, void* data);
+typedef std::map<std::string, ScriptingFunction> FunctionCacheMap;
 
-    class DBClientWithCommands;
-    class DBClientBase;
+class DBClientBase;
+class OperationContext;
 
-    struct JSFile {
-        const char* name;
-        const StringData& source;
-    };
+struct JSFile {
+    const char* name;
+    const StringData source;
+};
 
-    class Scope : boost::noncopyable {
-    public:
-        Scope();
-        virtual ~Scope();
+class Scope {
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
 
-        virtual void reset() = 0;
-        virtual void init(const BSONObj* data) = 0;
-        void init(const char* data) {
-            BSONObj o(data);
-            init(&o);
-        }
+public:
+    Scope();
+    virtual ~Scope();
 
-        virtual void localConnect(const char* dbName) = 0;
-        virtual void externalSetup() = 0;
-        virtual void setLocalDB(const string& localDBName) { _localDBName = localDBName; }
-        virtual BSONObj getObject(const char* field) = 0;
-        virtual string getString(const char* field) = 0;
-        virtual bool getBoolean(const char* field) = 0;
-        virtual double getNumber(const char* field) = 0;
-        virtual int getNumberInt(const char* field) { return (int)getNumber(field); }
-        virtual long long getNumberLongLong(const char* field) {
-            return static_cast<long long>(getNumber(field));
-        }
+    virtual void reset() = 0;
+    virtual void init(const BSONObj* data) = 0;
+    virtual void registerOperation(OperationContext* opCtx) = 0;
+    virtual void unregisterOperation() = 0;
 
-        virtual void setElement(const char* field, const BSONElement& e) = 0;
-        virtual void setNumber(const char* field, double val) = 0;
-        virtual void setString(const char* field, const StringData& val) = 0;
-        virtual void setObject(const char* field, const BSONObj& obj, bool readOnly=true) = 0;
-        virtual void setBoolean(const char* field, bool val) = 0;
-        virtual void setFunction(const char* field, const char* code) = 0;
+    void init(const char* data) {
+        BSONObj o(data);
+        init(&o);
+    }
 
-        virtual int type(const char* field) = 0;
+    virtual void externalSetup() = 0;
+    virtual void setLocalDB(const std::string& localDBName) {
+        _localDBName = localDBName;
+    }
 
-        virtual void append(BSONObjBuilder& builder, const char* fieldName, const char* scopeName);
+    virtual BSONObj getObject(const char* field) = 0;
+    virtual std::string getString(const char* field) = 0;
+    virtual bool getBoolean(const char* field) = 0;
+    virtual double getNumber(const char* field) = 0;
+    virtual int getNumberInt(const char* field) = 0;
 
-        virtual void rename(const char* from, const char* to) = 0;
+    virtual long long getNumberLongLong(const char* field) = 0;
 
-        virtual string getError() = 0;
+    virtual Decimal128 getNumberDecimal(const char* field) = 0;
 
-        virtual bool hasOutOfMemoryException() = 0;
+    virtual void setElement(const char* field, const BSONElement& e, const BSONObj& parent) = 0;
+    virtual void setNumber(const char* field, double val) = 0;
+    virtual void setString(const char* field, StringData val) = 0;
+    virtual void setObject(const char* field, const BSONObj& obj, bool readOnly = true) = 0;
+    virtual void setBoolean(const char* field, bool val) = 0;
+    virtual void setFunction(const char* field, const char* code) = 0;
 
-        virtual void installBenchRun();
+    virtual int type(const char* field) = 0;
 
-        virtual bool isKillPending() const = 0;
+    virtual void append(BSONObjBuilder& builder, const char* fieldName, const char* scopeName);
 
-        virtual void gc() = 0;
+    virtual void rename(const char* from, const char* to) = 0;
 
-        virtual ScriptingFunction createFunction(const char* code);
+    virtual std::string getError() = 0;
 
-        /**
-         * @return 0 on success
-         */
-        int invoke(const char* code, const BSONObj* args, const BSONObj* recv, int timeoutMs = 0);
+    virtual bool hasOutOfMemoryException() = 0;
 
-        virtual int invoke(ScriptingFunction func, const BSONObj* args, const BSONObj* recv,
-                           int timeoutMs = 0, bool ignoreReturn = false, bool readOnlyArgs = false,
-                           bool readOnlyRecv = false) = 0;
+    virtual void kill() = 0;
 
-        void invokeSafe(ScriptingFunction func, const BSONObj* args, const BSONObj* recv,
-                        int timeoutMs = 0, bool ignoreReturn = false, bool readOnlyArgs = false,
-                        bool readOnlyRecv = false) {
-            int res = invoke(func, args, recv, timeoutMs, ignoreReturn,
-                             readOnlyArgs, readOnlyRecv);
-            if (res == 0)
-                return;
-            uasserted(9004, string("invoke failed: ") + getError());
-        }
+    virtual bool isKillPending() const = 0;
 
-        void invokeSafe(const char* code, const BSONObj* args, const BSONObj* recv,
-                        int timeoutMs = 0) {
-            if (invoke(code, args, recv, timeoutMs) == 0)
-                return;
-            uasserted(9005, string("invoke failed: ") + getError());
-        }
+    virtual void gc() = 0;
 
-        virtual void injectNative(const char* field, NativeFunction func, void* data = 0) = 0;
+    virtual void advanceGeneration() = 0;
 
-        virtual bool exec(const StringData& code, const string& name, bool printResult,
-                          bool reportError, bool assertOnError, int timeoutMs = 0) = 0;
+    virtual void requireOwnedObjects() = 0;
 
-        virtual void execSetup(const StringData& code, const string& name = "setup") {
-            exec(code, name, false, true, true, 0);
-        }
+    virtual ScriptingFunction createFunction(const char* code);
 
-        void execSetup(const JSFile& file) {
-            execSetup(file.source, file.name);
-        }
+    /**
+     * @return 0 on success
+     */
+    int invoke(const char* code, const BSONObj* args, const BSONObj* recv, int timeoutMs = 0);
 
-        virtual bool execFile(const string& filename, bool printResult, bool reportError,
-                              int timeoutMs = 0);
+    virtual int invoke(ScriptingFunction func,
+                       const BSONObj* args,
+                       const BSONObj* recv,
+                       int timeoutMs = 0,
+                       bool ignoreReturn = false,
+                       bool readOnlyArgs = false,
+                       bool readOnlyRecv = false) = 0;
 
-        void execCoreFiles();
+    void invokeSafe(ScriptingFunction func,
+                    const BSONObj* args,
+                    const BSONObj* recv,
+                    int timeoutMs = 0,
+                    bool ignoreReturn = false,
+                    bool readOnlyArgs = false,
+                    bool readOnlyRecv = false) {
+        int res = invoke(func, args, recv, timeoutMs, ignoreReturn, readOnlyArgs, readOnlyRecv);
+        if (res == 0)
+            return;
+        uasserted(9004, std::string("invoke failed: ") + getError());
+    }
 
-        virtual void loadStored(bool ignoreNotConnected = false);
+    void invokeSafe(const char* code, const BSONObj* args, const BSONObj* recv, int timeoutMs = 0) {
+        if (invoke(code, args, recv, timeoutMs) == 0)
+            return;
+        uasserted(9005, std::string("invoke failed: ") + getError());
+    }
 
-        /**
-         * if any changes are made to .system.js, call this
-         * right now its just global - slightly inefficient, but a lot simpler
-         */
-        static void storedFuncMod();
+    virtual void injectNative(const char* field, NativeFunction func, void* data = 0) = 0;
 
-        static void validateObjectIdString(const string& str);
+    virtual bool exec(StringData code,
+                      const std::string& name,
+                      bool printResult,
+                      bool reportError,
+                      bool assertOnError,
+                      int timeoutMs = 0) = 0;
 
-        /** increments the number of times a scope was used */
-        void incTimesUsed() { ++_numTimesUsed; }
+    virtual void execSetup(StringData code, const std::string& name = "setup") {
+        exec(code, name, false, true, true, 0);
+    }
 
-        /** gets the number of times a scope was used */
-        int getTimesUsed() { return _numTimesUsed; }
+    void execSetup(const JSFile& file) {
+        execSetup(file.source, file.name);
+    }
 
-        /** return true if last invoke() return'd native code */
-        virtual bool isLastRetNativeCode() { return _lastRetIsNativeCode; }
+    virtual bool execFile(const std::string& filename,
+                          bool printResult,
+                          bool reportError,
+                          int timeoutMs = 0);
 
-        class NoDBAccess {
-            Scope* _s;
-        public:
-            NoDBAccess(Scope* s) : _s(s) {
-            }
-            ~NoDBAccess() {
-                _s->rename("____db____", "db");
-            }
-        };
-        NoDBAccess disableDBAccess(const char* why) {
-            rename("db", "____db____");
-            return NoDBAccess(this);
-        }
+    void execCoreFiles();
 
-    protected:
-        friend class PooledScope;
-        virtual FunctionCacheMap& getFunctionCache() { return _cachedFunctions; }
-        virtual ScriptingFunction _createFunction(const char* code,
-                                                  ScriptingFunction functionNumber = 0) = 0;
+    virtual void loadStored(OperationContext* opCtx, bool ignoreNotConnected = false);
 
-        string _localDBName;
-        long long _loadedVersion;
-        set<string> _storedNames;
-        static long long _lastVersion;
-        FunctionCacheMap _cachedFunctions;
-        int _numTimesUsed;
-        bool _lastRetIsNativeCode; // v8 only: set to true if eval'd script returns a native func
-    };
+    /**
+     * if any changes are made to .system.js, call this
+     * right now its just global - slightly inefficient, but a lot simpler
+     */
+    static void storedFuncMod(OperationContext* opCtx);
 
-    class ScriptEngine : boost::noncopyable {
-    public:
-        ScriptEngine();
-        virtual ~ScriptEngine();
+    static void validateObjectIdString(const std::string& str);
 
-        virtual Scope* newScope() {
-            return createScope();
-        }
+    /** gets the time at which the scope was created */
+    Date_t getCreateTime() const {
+        return _createTime;
+    }
 
-        virtual void runTest() = 0;
+    /** return true if last invoke() return'd native code */
+    virtual bool isLastRetNativeCode() {
+        return _lastRetIsNativeCode;
+    }
 
-        virtual bool utf8Ok() const = 0;
+protected:
+    friend class PooledScope;
 
-        static void setup();
+    /**
+     * RecoveryUnit::Change subclass used to commit work for
+     * Scope::storedFuncMod logOp listener.
+     */
+    class StoredFuncModLogOpHandler;
 
-        /** gets a scope from the pool or a new one if pool is empty
-         * @param db The db name
-         * @param scopeType A unique id to limit scope sharing.
-         *                  This must include authenticated users.
-         * @return the scope
-         */
-        auto_ptr<Scope> getPooledScope(const string& db, const string& scopeType);
+    virtual ScriptingFunction _createFunction(const char* code) = 0;
 
-        void setScopeInitCallback(void (*func)(Scope&)) { _scopeInitCallback = func; }
-        static void setConnectCallback(void (*func)(DBClientWithCommands&)) {
-            _connectCallback = func;
-        }
-        static void runConnectCallback(DBClientWithCommands& c) {
-            if (_connectCallback)
-                _connectCallback(c);
-        }
+    std::string _localDBName;
+    int64_t _loadedVersion;
+    std::set<std::string> _storedNames;
+    static AtomicWord<long long> _lastVersion;
+    FunctionCacheMap _cachedFunctions;
+    Date_t _createTime;
+    bool _lastRetIsNativeCode;  // v8 only: set to true if eval'd script returns a native func
+};
 
-        // engine implementation may either respond to interrupt events or
-        // poll for interrupts.  the interrupt functions must not wait indefinitely on a lock.
-        virtual void interrupt(unsigned opId) {}
-        virtual void interruptAll() {}
-        static void setGetCurrentOpIdCallback(unsigned (*func)()) {
-            _getCurrentOpIdCallback = func;
-        }
-        static bool haveGetCurrentOpIdCallback() { return _getCurrentOpIdCallback; }
-        static unsigned getCurrentOpId() {
-            massert(13474, "no _getCurrentOpIdCallback", _getCurrentOpIdCallback);
-            return _getCurrentOpIdCallback();
-        }
-        static void setCheckInterruptCallback(const char* (*func)()) {
-            _checkInterruptCallback = func;
-        }
-        static bool haveCheckInterruptCallback() { return _checkInterruptCallback; }
-        static const char* checkInterrupt() {
-            return _checkInterruptCallback ? _checkInterruptCallback() : "";
-        }
-        static bool interrupted() {
-            const char* r = checkInterrupt();
-            return r && r[0];
-        }
+class ScriptEngine : public KillOpListenerInterface {
+    ScriptEngine(const ScriptEngine&) = delete;
+    ScriptEngine& operator=(const ScriptEngine&) = delete;
 
-        static std::string getInterpreterVersionString();
+public:
+    ScriptEngine();
+    virtual ~ScriptEngine();
 
-    protected:
-        virtual Scope* createScope() = 0;
-        void (*_scopeInitCallback)(Scope&);
+    virtual Scope* newScope() {
+        return createScope();
+    }
 
-    private:
-        static void (*_connectCallback)(DBClientWithCommands&);
-        static const char* (*_checkInterruptCallback)();
-        static unsigned (*_getCurrentOpIdCallback)();
-    };
+    virtual Scope* newScopeForCurrentThread() {
+        return createScopeForCurrentThread();
+    }
 
-    void installGlobalUtils(Scope& scope);
-    bool hasJSReturn(const string& s);
-    const char* jsSkipWhiteSpace(const char* raw);
+    virtual void runTest() = 0;
 
-    extern ScriptEngine* globalScriptEngine;
-    extern DBClientBase* directDBClient;
+    virtual bool utf8Ok() const = 0;
+
+    virtual void enableJIT(bool value) = 0;
+    virtual bool isJITEnabled() const = 0;
+
+    virtual void enableJavaScriptProtection(bool value) = 0;
+    virtual bool isJavaScriptProtectionEnabled() const = 0;
+
+    virtual int getJSHeapLimitMB() const = 0;
+    virtual void setJSHeapLimitMB(int limit) = 0;
+
+    static void setup();
+    static void dropScopeCache();
+
+    /** gets a scope from the pool or a new one if pool is empty
+     * @param db The db name
+     * @param scopeType A unique id to limit scope sharing.
+     *                  This must include authenticated users.
+     * @return the scope
+     */
+    std::unique_ptr<Scope> getPooledScope(OperationContext* opCtx,
+                                          const std::string& db,
+                                          const std::string& scopeType);
+
+    void setScopeInitCallback(void (*func)(Scope&)) {
+        _scopeInitCallback = func;
+    }
+    static void setConnectCallback(void (*func)(DBClientBase&)) {
+        _connectCallback = func;
+    }
+    static void runConnectCallback(DBClientBase& c) {
+        if (_connectCallback)
+            _connectCallback(c);
+    }
+
+    // engine implementation may either respond to interrupt events or
+    // poll for interrupts.  the interrupt functions must not wait indefinitely on a lock.
+    virtual void interrupt(unsigned opId) {}
+    virtual void interruptAll() {}
+
+    static std::string getInterpreterVersionString();
+
+protected:
+    virtual Scope* createScope() = 0;
+    virtual Scope* createScopeForCurrentThread() = 0;
+    void (*_scopeInitCallback)(Scope&);
+
+private:
+    static void (*_connectCallback)(DBClientBase&);
+};
+
+void installGlobalUtils(Scope& scope);
+bool hasJSReturn(const std::string& s);
+const char* jsSkipWhiteSpace(const char* raw);
+
+ScriptEngine* getGlobalScriptEngine();
+void setGlobalScriptEngine(ScriptEngine* impl);
 }

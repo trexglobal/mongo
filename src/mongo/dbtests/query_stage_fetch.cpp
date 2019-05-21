@@ -1,440 +1,238 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
  * This file tests db/exec/fetch.cpp.  Fetch goes to disk so we cannot test outside of a dbtest.
  */
 
-#include <boost/shared_ptr.hpp>
+#include "mongo/platform/basic.h"
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/mock_stage.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/structure/collection_iterator.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/fail_point_registry.h"
-#include "mongo/util/fail_point_service.h"
+#include "mongo/stdx/memory.h"
 
 namespace QueryStageFetch {
 
-    class QueryStageFetchBase {
-    public:
-        QueryStageFetchBase() { }
+using std::set;
+using std::shared_ptr;
+using std::unique_ptr;
+using stdx::make_unique;
 
-        virtual ~QueryStageFetchBase() {
-            _client.dropCollection(ns());
+class QueryStageFetchBase {
+public:
+    QueryStageFetchBase() : _client(&_opCtx) {}
+
+    virtual ~QueryStageFetchBase() {
+        _client.dropCollection(ns());
+    }
+
+    void getRecordIds(set<RecordId>* out, Collection* coll) {
+        auto cursor = coll->getCursor(&_opCtx);
+        while (auto record = cursor->next()) {
+            out->insert(record->id);
+        }
+    }
+
+    void insert(const BSONObj& obj) {
+        _client.insert(ns(), obj);
+    }
+
+    void remove(const BSONObj& obj) {
+        _client.remove(ns(), obj);
+    }
+
+    static const char* ns() {
+        return "unittests.QueryStageFetch";
+    }
+    static NamespaceString nss() {
+        return NamespaceString(ns());
+    }
+
+protected:
+    const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
+    OperationContext& _opCtx = *_opCtxPtr;
+    DBDirectClient _client;
+};
+
+
+//
+// Test that a WSM with an obj is passed through verbatim.
+//
+class FetchStageAlreadyFetched : public QueryStageFetchBase {
+public:
+    void run() {
+        dbtests::WriteContextForTests ctx(&_opCtx, ns());
+        Database* db = ctx.db();
+        Collection* coll = db->getCollection(&_opCtx, nss());
+        if (!coll) {
+            WriteUnitOfWork wuow(&_opCtx);
+            coll = db->createCollection(&_opCtx, nss());
+            wuow.commit();
         }
 
-        void getLocs(set<DiskLoc>* out, Collection* coll) {
-            CollectionIterator* it = coll->getIterator(DiskLoc(), false,
-                                                       CollectionScanParams::FORWARD);
-            while (!it->isEOF()) {
-                DiskLoc nextLoc = it->getNext();
-                out->insert(nextLoc);
-            }
-            delete it;
+        WorkingSet ws;
+
+        // Add an object to the DB.
+        insert(BSON("foo" << 5));
+        set<RecordId> recordIds;
+        getRecordIds(&recordIds, coll);
+        ASSERT_EQUALS(size_t(1), recordIds.size());
+
+        // Create a mock stage that returns the WSM.
+        auto mockStage = make_unique<QueuedDataStage>(&_opCtx, &ws);
+
+        // Mock data.
+        {
+            WorkingSetID id = ws.allocate();
+            WorkingSetMember* mockMember = ws.get(id);
+            mockMember->recordId = *recordIds.begin();
+            mockMember->obj = coll->docFor(&_opCtx, mockMember->recordId);
+            ws.transitionToRecordIdAndObj(id);
+            // Points into our DB.
+            mockStage->pushBack(id);
+        }
+        {
+            WorkingSetID id = ws.allocate();
+            WorkingSetMember* mockMember = ws.get(id);
+            mockMember->recordId = RecordId();
+            mockMember->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("foo" << 6));
+            mockMember->transitionToOwnedObj();
+            ASSERT_TRUE(mockMember->obj.value().isOwned());
+            mockStage->pushBack(id);
         }
 
-        void insert(const BSONObj& obj) {
-            _client.insert(ns(), obj);
+        unique_ptr<FetchStage> fetchStage(
+            new FetchStage(&_opCtx, &ws, mockStage.release(), NULL, coll));
+
+        WorkingSetID id = WorkingSet::INVALID_ID;
+        PlanStage::StageState state;
+
+        // Don't bother doing any fetching if an obj exists already.
+        state = fetchStage->work(&id);
+        ASSERT_EQUALS(PlanStage::ADVANCED, state);
+        state = fetchStage->work(&id);
+        ASSERT_EQUALS(PlanStage::ADVANCED, state);
+
+        // No more data to fetch, so, EOF.
+        state = fetchStage->work(&id);
+        ASSERT_EQUALS(PlanStage::IS_EOF, state);
+    }
+};
+
+//
+// Test matching with fetch.
+//
+class FetchStageFilter : public QueryStageFetchBase {
+public:
+    void run() {
+        Lock::DBLock lk(&_opCtx, nss().db(), MODE_X);
+        OldClientContext ctx(&_opCtx, ns());
+        Database* db = ctx.db();
+        Collection* coll = db->getCollection(&_opCtx, nss());
+        if (!coll) {
+            WriteUnitOfWork wuow(&_opCtx);
+            coll = db->createCollection(&_opCtx, nss());
+            wuow.commit();
         }
 
-        void remove(const BSONObj& obj) {
-            _client.remove(ns(), obj);
-        }
+        WorkingSet ws;
 
-        static const char* ns() { return "unittests.QueryStageFetch"; }
+        // Add an object to the DB.
+        insert(BSON("foo" << 5));
+        set<RecordId> recordIds;
+        getRecordIds(&recordIds, coll);
+        ASSERT_EQUALS(size_t(1), recordIds.size());
 
-    private:
-        static DBDirectClient _client;
-    };
+        // Create a mock stage that returns the WSM.
+        auto mockStage = make_unique<QueuedDataStage>(&_opCtx, &ws);
 
-    DBDirectClient QueryStageFetchBase::_client;
+        // Mock data.
+        {
+            WorkingSetID id = ws.allocate();
+            WorkingSetMember* mockMember = ws.get(id);
+            mockMember->recordId = *recordIds.begin();
+            ws.transitionToRecordIdAndIdx(id);
 
-    //
-    // Test that a fetch is passed up when it's not in memory.
-    //
-    class FetchStageNotInMemory : public QueryStageFetchBase {
-    public:
-        void run() {
-            Client::WriteContext ctx(ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
-            if (!coll) {
-                coll = db->createCollection(ns());
-            }
-            WorkingSet ws;
-
-            // Add an object to the DB.
-            insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
-            getLocs(&locs, coll);
-            ASSERT_EQUALS(size_t(1), locs.size());
-
-            // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
-
-            // Mock data.
-            {
-                WorkingSetMember mockMember;
-                mockMember.state = WorkingSetMember::LOC_AND_IDX;
-                mockMember.loc = *locs.begin();
-
-                // State is loc and index, shouldn't be able to get the foo data inside.
-                BSONElement elt;
-                ASSERT_FALSE(mockMember.getFieldDotted("foo", &elt));
-                mockStage->pushBack(mockMember);
-            }
-
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL));
-
-            // Set the fail point to return not in memory.
-            FailPointRegistry* reg = getGlobalFailPointRegistry();
-            FailPoint* fetchInMemoryFail = reg->getFailPoint("fetchInMemoryFail");
-            fetchInMemoryFail->setMode(FailPoint::alwaysOn);
-
-            // First call should return a fetch request as it's not in memory.
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state;
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::NEED_FETCH, state);
-
-            // Let's do the fetch ourselves (though it doesn't really matter)
-            WorkingSetMember* member = ws.get(id);
-            ASSERT_FALSE(member->hasObj());
-            member->loc.rec()->touch();
-
-            // Next call to work() should give us the object in a diff. state
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::ADVANCED, state);
-            ASSERT_EQUALS(WorkingSetMember::LOC_AND_UNOWNED_OBJ, member->state);
-
-            // We should be able to get data from the obj now.
+            // State is RecordId and index, shouldn't be able to get the foo data inside.
             BSONElement elt;
-            ASSERT_TRUE(member->getFieldDotted("foo", &elt));
-            ASSERT_EQUALS(elt.numberInt(), 5);
-
-            // Mock stage is EOF so fetch should be too.
-            ASSERT_TRUE(fetchStage->isEOF());
-
-            // Turn off fail point for further tests.
-            fetchInMemoryFail->setMode(FailPoint::off);
+            ASSERT_FALSE(mockMember->getFieldDotted("foo", &elt));
+            mockStage->pushBack(id);
         }
-    };
 
-    //
-    // Test that a fetch is not passed up when it's in memory.
-    //
-    class FetchStageInMemory : public QueryStageFetchBase {
-    public:
-        void run() {
-            Client::WriteContext ctx(ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
-            if (!coll) {
-                coll = db->createCollection(ns());
-            }
-            WorkingSet ws;
+        // Make the filter.
+        BSONObj filterObj = BSON("foo" << 6);
+        const CollatorInterface* collator = nullptr;
+        const boost::intrusive_ptr<ExpressionContext> expCtx(
+            new ExpressionContext(&_opCtx, collator));
+        StatusWithMatchExpression statusWithMatcher =
+            MatchExpressionParser::parse(filterObj, expCtx);
+        verify(statusWithMatcher.isOK());
+        unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
-            // Add an object to the DB.
-            insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
-            getLocs(&locs, coll);
-            ASSERT_EQUALS(size_t(1), locs.size());
+        // Matcher requires that foo==6 but we only have data with foo==5.
+        unique_ptr<FetchStage> fetchStage(
+            new FetchStage(&_opCtx, &ws, mockStage.release(), filterExpr.get(), coll));
 
-            // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
+        // First call should return a fetch request as it's not in memory.
+        WorkingSetID id = WorkingSet::INVALID_ID;
+        PlanStage::StageState state;
 
-            // Mock data.
-            {
-                WorkingSetMember mockMember;
-                mockMember.state = WorkingSetMember::LOC_AND_IDX;
-                mockMember.loc = *locs.begin();
+        // Normally we'd return the object but we have a filter that prevents it.
+        state = fetchStage->work(&id);
+        ASSERT_EQUALS(PlanStage::NEED_TIME, state);
 
-                // State is loc and index, shouldn't be able to get the foo data inside.
-                BSONElement elt;
-                ASSERT_FALSE(mockMember.getFieldDotted("foo", &elt));
-                mockStage->pushBack(mockMember);
-            }
+        // No more data to fetch, so, EOF.
+        state = fetchStage->work(&id);
+        ASSERT_EQUALS(PlanStage::IS_EOF, state);
+    }
+};
 
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL));
+class All : public Suite {
+public:
+    All() : Suite("query_stage_fetch") {}
 
-            // Set the fail point to return in memory.
-            FailPointRegistry* reg = getGlobalFailPointRegistry();
-            FailPoint* fetchInMemorySucceed = reg->getFailPoint("fetchInMemorySucceed");
-            fetchInMemorySucceed->setMode(FailPoint::alwaysOn);
+    void setupTests() {
+        add<FetchStageAlreadyFetched>();
+        add<FetchStageFilter>();
+    }
+};
 
-            // First call fetches as expected.
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state;
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::ADVANCED, state);
-
-            // State should have changed.
-            WorkingSetMember* member = ws.get(id);
-            ASSERT_EQUALS(WorkingSetMember::LOC_AND_UNOWNED_OBJ, member->state);
-
-            // We should be able to get data from the obj now.
-            BSONElement elt;
-            ASSERT_TRUE(member->getFieldDotted("foo", &elt));
-            ASSERT_EQUALS(elt.numberInt(), 5);
-
-            // Mock stage is EOF so fetch should be too.
-            ASSERT_TRUE(fetchStage->isEOF());
-
-            // Turn off fail point for further tests.
-            fetchInMemorySucceed->setMode(FailPoint::off);
-        }
-    };
-
-    //
-    // Test mid-fetch invalidation.
-    //
-    class FetchStageInvalidation : public QueryStageFetchBase {
-    public:
-        void run() {
-            Client::WriteContext ctx(ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
-            if (!coll) {
-                coll = db->createCollection(ns());
-            }
-            WorkingSet ws;
-
-            // Add an object to the DB.
-            insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
-            getLocs(&locs, coll);
-            ASSERT_EQUALS(size_t(1), locs.size());
-
-            // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
-
-            // Mock data.
-            {
-                WorkingSetMember mockMember;
-                mockMember.state = WorkingSetMember::LOC_AND_IDX;
-                mockMember.loc = *locs.begin();
-
-                // State is loc and index, shouldn't be able to get the foo data inside.
-                BSONElement elt;
-                ASSERT_FALSE(mockMember.getFieldDotted("foo", &elt));
-                mockStage->pushBack(mockMember);
-            }
-
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL));
-
-            // Set the fail point to return not in memory.
-            FailPointRegistry* reg = getGlobalFailPointRegistry();
-            FailPoint* fetchInMemoryFail = reg->getFailPoint("fetchInMemoryFail");
-            fetchInMemoryFail->setMode(FailPoint::alwaysOn);
-
-            // First call should return a fetch request as it's not in memory.
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state;
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::NEED_FETCH, state);
-
-            WorkingSetMember* member = ws.get(id);
-
-            // Invalidate the DL.
-            fetchStage->invalidate(member->loc, INVALIDATION_DELETION);
-
-            // Next call to work() should give us the OWNED obj as it was invalidated mid-page-in.
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::ADVANCED, state);
-            ASSERT_EQUALS(WorkingSetMember::OWNED_OBJ, member->state);
-
-            // We should be able to get data from the obj now.
-            BSONElement elt;
-            ASSERT_TRUE(member->getFieldDotted("foo", &elt));
-            ASSERT_EQUALS(elt.numberInt(), 5);
-
-            // Mock stage is EOF so fetch should be too.
-            ASSERT_TRUE(fetchStage->isEOF());
-
-            // Turn off fail point for further tests.
-            fetchInMemoryFail->setMode(FailPoint::off);
-        }
-    };
-
-
-    //
-    // Test that a WSM with an obj is passed through verbatim.
-    //
-    class FetchStageAlreadyFetched : public QueryStageFetchBase {
-    public:
-        void run() {
-            Client::WriteContext ctx(ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
-            if (!coll) {
-                coll = db->createCollection(ns());
-            }
-            WorkingSet ws;
-
-            // Add an object to the DB.
-            insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
-            getLocs(&locs, coll);
-            ASSERT_EQUALS(size_t(1), locs.size());
-
-            // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
-
-            // Mock data.
-            {
-                WorkingSetMember mockMember;
-                mockMember.state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-                mockMember.loc = *locs.begin();
-                mockMember.obj = mockMember.loc.obj();
-                // Points into our DB.
-                ASSERT_FALSE(mockMember.obj.isOwned());
-                mockStage->pushBack(mockMember);
-
-                mockMember.state = WorkingSetMember::OWNED_OBJ;
-                mockMember.loc = DiskLoc();
-                mockMember.obj = BSON("foo" << 6);
-                ASSERT_TRUE(mockMember.obj.isOwned());
-                mockStage->pushBack(mockMember);
-            }
-
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(), NULL));
-
-            // Set the fail point to return not in memory so we get a fetch request.
-            FailPointRegistry* reg = getGlobalFailPointRegistry();
-            FailPoint* fetchInMemoryFail = reg->getFailPoint("fetchInMemoryFail");
-            fetchInMemoryFail->setMode(FailPoint::alwaysOn);
-
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state;
-
-            // Don't bother doing any fetching if an obj exists already.
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::ADVANCED, state);
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::ADVANCED, state);
-
-            // No more data to fetch, so, EOF.
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::IS_EOF, state);
-
-            fetchInMemoryFail->setMode(FailPoint::off);
-        }
-    };
-
-    //
-    // Test matching with fetch.
-    //
-    class FetchStageFilter : public QueryStageFetchBase {
-    public:
-        void run() {
-            Client::WriteContext ctx(ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(ns());
-            if (!coll) {
-                coll = db->createCollection(ns());
-            }
-            WorkingSet ws;
-
-            // Add an object to the DB.
-            insert(BSON("foo" << 5));
-            set<DiskLoc> locs;
-            getLocs(&locs, coll);
-            ASSERT_EQUALS(size_t(1), locs.size());
-
-            // Create a mock stage that returns the WSM.
-            auto_ptr<MockStage> mockStage(new MockStage(&ws));
-
-            // Mock data.
-            {
-                WorkingSetMember mockMember;
-                mockMember.state = WorkingSetMember::LOC_AND_IDX;
-                mockMember.loc = *locs.begin();
-
-                // State is loc and index, shouldn't be able to get the foo data inside.
-                BSONElement elt;
-                ASSERT_FALSE(mockMember.getFieldDotted("foo", &elt));
-                mockStage->pushBack(mockMember);
-            }
-
-            // Make the filter.
-            BSONObj filterObj = BSON("foo" << 6);
-            StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
-            verify(swme.isOK());
-            auto_ptr<MatchExpression> filterExpr(swme.getValue());
-
-            // Matcher requires that foo==6 but we only have data with foo==5.
-            auto_ptr<FetchStage> fetchStage(new FetchStage(&ws, mockStage.release(),
-                                                           filterExpr.get()));
-
-            // Set the fail point to return not in memory so we get a fetch request.
-            FailPointRegistry* reg = getGlobalFailPointRegistry();
-            FailPoint* fetchInMemoryFail = reg->getFailPoint("fetchInMemoryFail");
-            fetchInMemoryFail->setMode(FailPoint::alwaysOn);
-
-            // First call should return a fetch request as it's not in memory.
-            WorkingSetID id = WorkingSet::INVALID_ID;
-            PlanStage::StageState state;
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::NEED_FETCH, state);
-
-            // Normally we'd return the object but we have a filter that prevents it.
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::NEED_TIME, state);
-
-            // No more data to fetch, so, EOF.
-            state = fetchStage->work(&id);
-            ASSERT_EQUALS(PlanStage::IS_EOF, state);
-
-            fetchInMemoryFail->setMode(FailPoint::off);
-        }
-    };
-
-    class All : public Suite {
-    public:
-        All() : Suite( "query_stage_fetch" ) { }
-
-        void setupTests() {
-            add<FetchStageNotInMemory>();
-            add<FetchStageInMemory>();
-            add<FetchStageAlreadyFetched>();
-            add<FetchStageInvalidation>();
-            add<FetchStageFilter>();
-        }
-    }  queryStageFetchAll;
+SuiteInstance<All> queryStageFetchAll;
 
 }  // namespace QueryStageFetch

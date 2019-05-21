@@ -1,16 +1,30 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
@@ -28,11 +42,12 @@
 
 #pragma once
 
+#include "mongo/base/deinitializer_context.h"
+#include "mongo/base/global_initializer.h"
+#include "mongo/base/global_initializer_registerer.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/initializer_context.h"
 #include "mongo/base/initializer_function.h"
-#include "mongo/base/global_initializer.h"
-#include "mongo/base/global_initializer_registerer.h"
 #include "mongo/base/make_string_vector.h"
 #include "mongo/base/status.h"
 
@@ -49,7 +64,7 @@
 /**
  * Convenience parameter representing the default set of dependents for initializer functions.
  */
-#define MONGO_DEFAULT_PREREQUISITES ("default")
+#define MONGO_DEFAULT_PREREQUISITES (::mongo::defaultInitializerName().c_str())
 
 /**
  * Macro to define an initializer function named "NAME" with the default prerequisites, and
@@ -85,8 +100,8 @@
  * dependents.
  *
  * NAME is any legitimate name for a C++ symbol.
- * PREREQUISITES is a tuple of 0 or more string literals, i.e., ("a", "b", "c"), or ()
- * DEPENDENTS is a tuple of 0 or more string literals.
+ * PREREQUISITES is a tuple of 0 or more std::string literals, i.e., ("a", "b", "c"), or ()
+ * DEPENDENTS is a tuple of 0 or more std::string literals.
  *
  * At run time, the full set of prerequisites for NAME will be computed as the union of the
  * explicit PREREQUISITES and the set of all other mongo initializers that name NAME in their
@@ -103,16 +118,17 @@
  * A form that takes an existing function or that lets the programmer supply the name
  * of the function to declare would be options.
  */
-#define MONGO_INITIALIZER_GENERAL(NAME, PREREQUISITES, DEPENDENTS) \
-    ::mongo::Status _MONGO_INITIALIZER_FUNCTION_NAME(NAME)(::mongo::InitializerContext*); \
-    namespace {                                                         \
-        ::mongo::GlobalInitializerRegisterer _mongoInitializerRegisterer_##NAME( \
-                #NAME,                                                  \
-                _MONGO_INITIALIZER_FUNCTION_NAME(NAME),                 \
-                MONGO_MAKE_STRING_VECTOR PREREQUISITES,                 \
-                MONGO_MAKE_STRING_VECTOR DEPENDENTS);                   \
-    }                                                                   \
-    ::mongo::Status _MONGO_INITIALIZER_FUNCTION_NAME(NAME)
+#define MONGO_INITIALIZER_GENERAL(NAME, PREREQUISITES, DEPENDENTS)                        \
+    ::mongo::Status MONGO_INITIALIZER_FUNCTION_NAME_(NAME)(::mongo::InitializerContext*); \
+    namespace {                                                                           \
+    ::mongo::GlobalInitializerRegisterer _mongoInitializerRegisterer_##NAME(              \
+        std::string(#NAME),                                                               \
+        mongo::InitializerFunction(MONGO_INITIALIZER_FUNCTION_NAME_(NAME)),               \
+        mongo::DeinitializerFunction(nullptr),                                            \
+        MONGO_MAKE_STRING_VECTOR PREREQUISITES,                                           \
+        MONGO_MAKE_STRING_VECTOR DEPENDENTS);                                             \
+    }                                                                                     \
+    ::mongo::Status MONGO_INITIALIZER_FUNCTION_NAME_(NAME)
 
 /**
  * Macro to define an initializer group.
@@ -121,12 +137,13 @@
  * initialization steps into phases, such as "all global parameter declarations completed", "all
  * global parameters initialized".
  */
-#define MONGO_INITIALIZER_GROUP(NAME, PREREQUISITES, DEPENDENTS)        \
-    MONGO_INITIALIZER_GENERAL(NAME, PREREQUISITES, DEPENDENTS)(         \
-            ::mongo::InitializerContext*) { return ::mongo::Status::OK(); }
+#define MONGO_INITIALIZER_GROUP(NAME, PREREQUISITES, DEPENDENTS)                               \
+    MONGO_INITIALIZER_GENERAL(NAME, PREREQUISITES, DEPENDENTS)(::mongo::InitializerContext*) { \
+        return ::mongo::Status::OK();                                                          \
+    }
 
 /**
  * Macro to produce a name for a mongo initializer function for an initializer operation
  * named "NAME".
  */
-#define _MONGO_INITIALIZER_FUNCTION_NAME(NAME) _mongoInitializerFunction_##NAME
+#define MONGO_INITIALIZER_FUNCTION_NAME_(NAME) _mongoInitializerFunction_##NAME

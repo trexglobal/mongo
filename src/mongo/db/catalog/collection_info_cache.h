@@ -1,112 +1,109 @@
-// collection_info_cache.h
-
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-
-#include "mongo/db/index_set.h"
-#include "mongo/db/query/query_settings.h"
+#include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/query_settings.h"
+#include "mongo/db/update_index_data.h"
 
 namespace mongo {
+class Collection;
+class IndexDescriptor;
+class OperationContext;
 
-    class Collection;
+/**
+ * this is for storing things that you want to cache about a single collection
+ * life cycle is managed for you from inside Collection.
+ */
+class CollectionInfoCache {
+public:
+    virtual ~CollectionInfoCache() = default;
 
     /**
-     * this is for storing things that you want to cache about a single collection
-     * life cycle is managed for you from inside Collection
+     * Builds internal cache state based on the current state of the Collection's IndexCatalog.
      */
-    class CollectionInfoCache {
-    public:
+    virtual void init(OperationContext* const opCtx) = 0;
 
-        CollectionInfoCache( Collection* collection );
+    /**
+     * Get the PlanCache for this collection.
+     */
+    virtual PlanCache* getPlanCache() const = 0;
 
-        /*
-         * resets entire cache state
-         */
-        void reset();
+    /**
+     * Get the QuerySettings for this collection.
+     */
+    virtual QuerySettings* getQuerySettings() const = 0;
 
-        //
-        // New Query Execution
-        //
+    /* get set of index keys for this namespace.  handy to quickly check if a given
+       field is indexed (Note it might be a secondary component of a compound index.)
+    */
+    virtual const UpdateIndexData& getIndexKeys(OperationContext* const opCtx) const = 0;
 
-        /**
-         * Get the PlanCache for this collection.
-         */
-        PlanCache* getPlanCache() const;
+    /**
+     * Returns cached index usage statistics for this collection.  The map returned will contain
+     * entry for each index in the collection along with both a usage counter and a timestamp
+     * representing the date/time the counter is valid from.
+     *
+     * Note for performance that this method returns a copy of a StringMap.
+     */
+    virtual CollectionIndexUsageMap getIndexUsageStats() const = 0;
 
-        /**
-         * Get the QuerySettings for this collection.
-         */
-        QuerySettings* getQuerySettings() const;
+    /**
+     * Register a newly-created index with the cache.  Must be called whenever an index is
+     * built on the associated collection.
+     *
+     * Must be called under exclusive collection lock.
+     */
+    virtual void addedIndex(OperationContext* const opCtx, const IndexDescriptor* const desc) = 0;
 
-        // -------------------
+    /**
+     * Deregister a newly-dropped index with the cache.  Must be called whenever an index is
+     * dropped on the associated collection.
+     *
+     * Must be called under exclusive collection lock.
+     */
+    virtual void droppedIndex(OperationContext* const opCtx, const StringData indexName) = 0;
 
-        /* get set of index keys for this namespace.  handy to quickly check if a given
-           field is indexed (Note it might be a secondary component of a compound index.)
-        */
-        const IndexPathSet& indexKeys() {
-            if ( !_keysComputed )
-                computeIndexKeys();
-            return _indexedPaths;
-        }
+    /**
+     * Removes all cached query plans.
+     */
+    virtual void clearQueryCache() = 0;
 
-        // ---------------------
+    /**
+     * Signal to the cache that a query operation has completed.  'indexesUsed' should list the
+     * set of indexes used by the winning plan, if any.
+     */
+    virtual void notifyOfQuery(OperationContext* const opCtx,
+                               const std::set<std::string>& indexesUsed) = 0;
 
-        /**
-         * Called when an index is added to this collection.
-         */
-        void addedIndex() { reset(); }
-
-        void clearQueryCache();
-
-        /* you must notify the cache if you are doing writes, as query plan utility will change */
-        void notifyOfWriteOp();
-
-    private:
-
-        Collection* _collection; // not owned
-
-        // ---  index keys cache
-        bool _keysComputed;
-        IndexPathSet _indexedPaths;
-
-        // A cache for query plans.
-        boost::scoped_ptr<PlanCache> _planCache;
-
-        // Query settings.
-        // Includes index filters.
-        boost::scoped_ptr<QuerySettings> _querySettings;
-
-        void computeIndexKeys();
-    };
-
+    virtual void setNs(NamespaceString ns) = 0;
+};
 }  // namespace mongo

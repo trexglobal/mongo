@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2008, 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/clientcursor.h"
 
@@ -35,407 +36,272 @@
 #include <vector>
 
 #include "mongo/base/counter.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/db.h"
-#include "mongo/db/introspect.h"
+#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/cursor_manager.h"
+#include "mongo/db/cursor_server_params.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_current_op.h"
-#include "mongo/db/pagefault.h"
-#include "mongo/db/repl/rs.h"
-#include "mongo/db/repl/write_concern.h"
-#include "mongo/platform/random.h"
-#include "mongo/util/processinfo.h"
-#include "mongo/util/timer.h"
+#include "mongo/db/query/explain.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/util/background.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
+#include "mongo/util/exit.h"
 
 namespace mongo {
 
-    static Counter64 cursorStatsOpen; // gauge
-    static Counter64 cursorStatsOpenPinned; // gauge
-    static Counter64 cursorStatsOpenNoTimeout; // gauge
-    static Counter64 cursorStatsTimedOut;
+using std::string;
+using std::stringstream;
 
-    static ServerStatusMetricField<Counter64> dCursorStatsOpen( "cursor.open.total",
-                                                                        &cursorStatsOpen );
-    static ServerStatusMetricField<Counter64> dCursorStatsOpenPinned( "cursor.open.pinned",
-                                                                      &cursorStatsOpenPinned );
-    static ServerStatusMetricField<Counter64> dCursorStatsOpenNoTimeout( "cursor.open.noTimeout",
-                                                                         &cursorStatsOpenNoTimeout );
-    static ServerStatusMetricField<Counter64> dCursorStatusTimedout( "cursor.timedOut",
-                                                                     &cursorStatsTimedOut );
+static Counter64 cursorStatsOpen;           // gauge
+static Counter64 cursorStatsOpenPinned;     // gauge
+static Counter64 cursorStatsOpenNoTimeout;  // gauge
+static Counter64 cursorStatsTimedOut;
 
-    long long ClientCursor::totalOpen() {
-        return cursorStatsOpen.get();
+static ServerStatusMetricField<Counter64> dCursorStatsOpen("cursor.open.total", &cursorStatsOpen);
+static ServerStatusMetricField<Counter64> dCursorStatsOpenPinned("cursor.open.pinned",
+                                                                 &cursorStatsOpenPinned);
+static ServerStatusMetricField<Counter64> dCursorStatsOpenNoTimeout("cursor.open.noTimeout",
+                                                                    &cursorStatsOpenNoTimeout);
+static ServerStatusMetricField<Counter64> dCursorStatusTimedout("cursor.timedOut",
+                                                                &cursorStatsTimedOut);
+
+long long ClientCursor::totalOpen() {
+    return cursorStatsOpen.get();
+}
+
+ClientCursor::ClientCursor(ClientCursorParams params,
+                           CursorId cursorId,
+                           OperationContext* operationUsingCursor,
+                           Date_t now)
+    : _cursorid(cursorId),
+      _nss(std::move(params.nss)),
+      _authenticatedUsers(std::move(params.authenticatedUsers)),
+      _lsid(operationUsingCursor->getLogicalSessionId()),
+      _txnNumber(operationUsingCursor->getTxnNumber()),
+      _readConcernArgs(params.readConcernArgs),
+      _originatingCommand(params.originatingCommandObj),
+      _originatingPrivileges(std::move(params.originatingPrivileges)),
+      _queryOptions(params.queryOptions),
+      _lockPolicy(params.lockPolicy),
+      _exec(std::move(params.exec)),
+      _operationUsingCursor(operationUsingCursor),
+      _lastUseDate(now),
+      _createdDate(now),
+      _planSummary(Explain::getPlanSummary(_exec.get())) {
+    invariant(_exec);
+    invariant(_operationUsingCursor);
+
+    cursorStatsOpen.increment();
+
+    if (isNoTimeout()) {
+        // cursors normally timeout after an inactivity period to prevent excess memory use
+        // setting this prevents timeout of the cursor in question.
+        cursorStatsOpenNoTimeout.increment();
+    }
+}
+
+ClientCursor::~ClientCursor() {
+    // Cursors must be unpinned and deregistered from their cursor manager before being deleted.
+    invariant(!_operationUsingCursor);
+    invariant(_disposed);
+
+    cursorStatsOpen.decrement();
+    if (isNoTimeout()) {
+        cursorStatsOpenNoTimeout.decrement();
+    }
+}
+
+void ClientCursor::markAsKilled(Status killStatus) {
+    _exec->markAsKilled(killStatus);
+}
+
+void ClientCursor::dispose(OperationContext* opCtx) {
+    if (_disposed) {
+        return;
     }
 
-    ClientCursor::ClientCursor(const Collection* collection, Runner* runner,
-                               int qopts, const BSONObj query)
-        : _collection( collection ),
-          _countedYet( false ) {
-        _runner.reset(runner);
-        _ns = runner->ns();
-        _query = query;
-        _queryOptions = qopts;
-        if ( runner->collection() ) {
-            invariant( collection == runner->collection() );
-        }
-        init();
+    _exec->dispose(opCtx);
+    _disposed = true;
+}
+
+GenericCursor ClientCursor::toGenericCursor() const {
+    GenericCursor gc;
+    gc.setCursorId(cursorid());
+    gc.setNs(nss());
+    gc.setNDocsReturned(nReturnedSoFar());
+    gc.setTailable(isTailable());
+    gc.setAwaitData(isAwaitData());
+    gc.setNoCursorTimeout(isNoTimeout());
+    gc.setOriginatingCommand(getOriginatingCommandObj());
+    gc.setLsid(getSessionId());
+    gc.setLastAccessDate(getLastUseDate());
+    gc.setCreatedDate(getCreatedDate());
+    gc.setNBatchesReturned(getNBatches());
+    gc.setPlanSummary(getPlanSummary());
+    if (auto opCtx = _operationUsingCursor) {
+        gc.setOperationUsingCursorId(opCtx->getOpID());
+    }
+    return gc;
+}
+
+//
+// Pin methods
+//
+
+ClientCursorPin::ClientCursorPin(OperationContext* opCtx,
+                                 ClientCursor* cursor,
+                                 CursorManager* cursorManager)
+    : _opCtx(opCtx), _cursor(cursor), _cursorManager(cursorManager) {
+    invariant(_cursor);
+    invariant(_cursor->_operationUsingCursor);
+    invariant(!_cursor->_disposed);
+
+    // We keep track of the number of cursors currently pinned. The cursor can become unpinned
+    // either by being released back to the cursor manager or by being deleted. A cursor may be
+    // transferred to another pin object via move construction or move assignment, but in this case
+    // it is still considered pinned.
+    cursorStatsOpenPinned.increment();
+}
+
+ClientCursorPin::ClientCursorPin(ClientCursorPin&& other)
+    : _opCtx(other._opCtx), _cursor(other._cursor), _cursorManager(other._cursorManager) {
+    // The pinned cursor is being transferred to us from another pin. The 'other' pin must have a
+    // pinned cursor.
+    invariant(other._cursor);
+    invariant(other._cursor->_operationUsingCursor);
+
+    // Be sure to set the 'other' pin's cursor to null in order to transfer ownership to ourself.
+    other._cursor = nullptr;
+    other._opCtx = nullptr;
+    other._cursorManager = nullptr;
+}
+
+ClientCursorPin& ClientCursorPin::operator=(ClientCursorPin&& other) {
+    if (this == &other) {
+        return *this;
     }
 
-    ClientCursor::ClientCursor(const Collection* collection)
-        : _ns(collection->ns().ns()),
-          _collection(collection),
-          _countedYet( false ),
-          _queryOptions(QueryOption_NoCursorTimeout) {
-        init();
+    // The pinned cursor is being transferred to us from another pin. The 'other' pin must have a
+    // pinned cursor, and we must not have a cursor.
+    invariant(!_cursor);
+    invariant(other._cursor);
+    invariant(other._cursor->_operationUsingCursor);
+
+    // Copy the cursor pointer to ourselves, but also be sure to set the 'other' pin's cursor to
+    // null so that it no longer has the cursor pinned.
+    // Be sure to set the 'other' pin's cursor to null in order to transfer ownership to ourself.
+    _cursor = other._cursor;
+    other._cursor = nullptr;
+
+    _opCtx = other._opCtx;
+    other._opCtx = nullptr;
+
+    _cursorManager = other._cursorManager;
+    other._cursorManager = nullptr;
+
+    return *this;
+}
+
+ClientCursorPin::~ClientCursorPin() {
+    release();
+}
+
+void ClientCursorPin::release() {
+    if (!_cursor)
+        return;
+
+    invariant(_cursor->_operationUsingCursor);
+    invariant(_cursorManager);
+
+    // Unpin the cursor. This must be done by calling into the cursor manager, since the cursor
+    // manager must acquire the appropriate mutex in order to safely perform the unpin operation.
+    _cursorManager->unpin(_opCtx, std::unique_ptr<ClientCursor, ClientCursor::Deleter>(_cursor));
+    cursorStatsOpenPinned.decrement();
+
+    _cursor = nullptr;
+}
+
+void ClientCursorPin::deleteUnderlying() {
+    invariant(_cursor);
+    invariant(_cursor->_operationUsingCursor);
+    invariant(_cursorManager);
+    // Note the following subtleties of this method's implementation:
+    // - We must unpin the cursor (by clearing the '_operationUsingCursor' field) before
+    //   destruction, since it is an error to delete a pinned cursor.
+    // - In addition, we must deregister the cursor before clearing the '_operationUsingCursor'
+    //   field, since it is an error to unpin a registered cursor without holding the appropriate
+    //   cursor manager mutex. By first deregistering the cursor, we ensure that no other thread can
+    //   access '_cursor', meaning that it is safe for us to write to '_operationUsingCursor'
+    //   without holding the CursorManager mutex.
+
+    _cursorManager->deregisterCursor(_cursor);
+
+    // Make sure the cursor is disposed and unpinned before being destroyed.
+    _cursor->dispose(_opCtx);
+    _cursor->_operationUsingCursor = nullptr;
+    delete _cursor;
+
+    cursorStatsOpenPinned.decrement();
+    _cursor = nullptr;
+}
+
+ClientCursor* ClientCursorPin::getCursor() const {
+    return _cursor;
+}
+
+namespace {
+//
+// ClientCursorMonitor
+//
+
+/**
+ * Thread for timing out inactive cursors.
+ */
+class ClientCursorMonitor : public BackgroundJob {
+public:
+    std::string name() const {
+        return "ClientCursorMonitor";
     }
 
-    void ClientCursor::init() {
-        invariant( _collection );
-
-        isAggCursor = false;
-
-        _idleAgeMillis = 0;
-        _leftoverMaxTimeMicros = 0;
-        _pinValue = 0;
-        _pos = 0;
-
-        Lock::assertAtLeastReadLocked(_ns);
-
-        if (_queryOptions & QueryOption_NoCursorTimeout) {
-            // cursors normally timeout after an inactivity period to prevent excess memory use
-            // setting this prevents timeout of the cursor in question.
-            ++_pinValue;
-            cursorStatsOpenNoTimeout.increment();
-        }
-
-        _cursorid = _collection->cursorCache()->registerCursor( this );
-
-        cursorStatsOpen.increment();
-        _countedYet = true;
-    }
-
-    ClientCursor::~ClientCursor() {
-        if( _pos == -2 ) {
-            // defensive: destructor called twice
-            wassert(false);
-            return;
-        }
-
-        if ( _countedYet ) {
-            _countedYet = false;
-            cursorStatsOpen.decrement();
-            if ( _pinValue == 1 )
-                cursorStatsOpenNoTimeout.decrement();
-        }
-
-        if ( _collection ) {
-            // this could be null if kill() was killed
-            _collection->cursorCache()->deregisterCursor( this );
-        }
-
-        // defensive:
-        _collection = NULL;
-        _cursorid = INVALID_CURSOR_ID;
-        _pos = -2;
-        _pinValue = 0;
-    }
-
-    void ClientCursor::kill() {
-        if ( _runner.get() )
-            _runner->kill();
-
-        _collection = NULL;
-    }
-
-    void yieldOrSleepFor1Microsecond() {
-#ifdef _WIN32
-        SwitchToThread();
-#elif defined(__linux__)
-        pthread_yield();
-#else
-        sleepmicros(1);
-#endif
-    }
-
-    void ClientCursor::staticYield(int micros, const StringData& ns, const Record* rec) {
-        bool haveReadLock = Lock::isReadLocked();
-
-        killCurrentOp.checkForInterrupt();
-        {
-            auto_ptr<LockMongoFilesShared> lk;
-            if ( rec ) {
-                // need to lock this else rec->touch won't be safe file could disappear
-                lk.reset( new LockMongoFilesShared() );
+    void run() {
+        ThreadClient tc("clientcursormon", getGlobalServiceContext());
+        while (!globalInShutdownDeprecated()) {
+            {
+                const ServiceContext::UniqueOperationContext opCtx = cc().makeOperationContext();
+                auto now = opCtx->getServiceContext()->getPreciseClockSource()->now();
+                cursorStatsTimedOut.increment(
+                    CursorManager::get(opCtx.get())->timeoutCursors(opCtx.get(), now));
             }
-
-            dbtempreleasecond unlock;
-            if ( unlock.unlocked() ) {
-                if ( haveReadLock ) {
-                    // This sleep helps reader threads yield to writer threads.
-                    // Without this, the underlying reader/writer lock implementations
-                    // are not sufficiently writer-greedy.
-#ifdef _WIN32
-                    SwitchToThread();
-#else
-                    if ( micros == 0 ) {
-                        yieldOrSleepFor1Microsecond();
-                    }
-                    else {
-                        sleepmicros(1);
-                    }
-#endif
-                }
-                else {
-                    if ( micros == -1 ) {
-                        sleepmicros(Client::recommendedYieldMicros());
-                    }
-                    else if ( micros == 0 ) {
-                        yieldOrSleepFor1Microsecond();
-                    }
-                    else if ( micros > 0 ) {
-                        sleepmicros( micros );
-                    }
-                }
-
-            }
-            else if ( Listener::getTimeTracker() == 0 ) {
-                // we aren't running a server, so likely a repair, so don't complain
-            }
-            else {
-                CurOp * c = cc().curop();
-                while ( c->parent() )
-                    c = c->parent();
-                warning() << "ClientCursor::staticYield can't unlock b/c of recursive lock"
-                          << " ns: " << ns 
-                          << " top: " << c->info()
-                          << endl;
-            }
-
-            if ( rec )
-                rec->touch();
-
-            lk.reset(0); // need to release this before dbtempreleasecond
+            MONGO_IDLE_THREAD_BLOCK;
+            sleepsecs(getClientCursorMonitorFrequencySecs());
         }
     }
+};
 
-    //
-    // Timing and timeouts
-    //
+// Only one instance of the ClientCursorMonitor exists
+ClientCursorMonitor clientCursorMonitor;
 
-    bool ClientCursor::shouldTimeout(unsigned millis) {
-        _idleAgeMillis += millis;
-        return _idleAgeMillis > 600000 && _pinValue == 0;
-    }
+void _appendCursorStats(BSONObjBuilder& b) {
+    b.append("note", "deprecated, use server status metrics");
+    b.appendNumber("clientCursors_size", cursorStatsOpen.get());
+    b.appendNumber("totalOpen", cursorStatsOpen.get());
+    b.appendNumber("pinned", cursorStatsOpenPinned.get());
+    b.appendNumber("totalNoTimeout", cursorStatsOpenNoTimeout.get());
+    b.appendNumber("timedOut", cursorStatsTimedOut.get());
+}
+}
 
-    void ClientCursor::setIdleTime( unsigned millis ) {
-        _idleAgeMillis = millis;
-    }
+void startClientCursorMonitor() {
+    clientCursorMonitor.go();
+}
 
-    void ClientCursor::updateSlaveLocation( CurOp& curop ) {
-        if ( _slaveReadTill.isNull() )
-            return;
-        mongo::updateSlaveLocation( curop , _ns.c_str() , _slaveReadTill );
-    }
-
-    int ClientCursor::suggestYieldMicros() {
-        int writers = 0;
-        int readers = 0;
-
-        int micros = Client::recommendedYieldMicros( &writers , &readers );
-
-        if ( micros > 0 && writers == 0 && Lock::isR() ) {
-            // we have a read lock, and only reads are coming on, so why bother unlocking
-            return 0;
-        }
-
-        wassert( micros < 10000000 );
-        dassert( micros <  1000001 );
-        return micros;
-    }
-
-    //
-    // Pin methods
-    // TODO: Simplify when we kill Cursor.  In particular, once we've pinned a CC, it won't be
-    // deleted from underneath us, so we can save the pointer and ignore the ID.
-    //
-
-    ClientCursorPin::ClientCursorPin( const Collection* collection, long long cursorid )
-        : _cursor( NULL ) {
-        cursorStatsOpenPinned.increment();
-        _cursor = collection->cursorCache()->find( cursorid );
-        if ( _cursor ) {
-            uassert( 12051,
-                     "clientcursor already in use? driver problem?",
-                     _cursor->_pinValue < 100 );
-            _cursor->_pinValue += 100;
-        }
-    }
-
-    ClientCursorPin::~ClientCursorPin() {
-        cursorStatsOpenPinned.decrement();
-        DESTRUCTOR_GUARD( release(); );
-    }
-
-    void ClientCursorPin::release() {
-        if ( !_cursor )
-            return;
-
-        invariant( _cursor->_pinValue >= 100 );
-        _cursor->_pinValue -= 100;
-
-        if ( _cursor->collection() == NULL ) {
-            // the ClientCursor was killed while we had it
-            // therefore its our responsibility to kill it
-            delete _cursor;
-            _cursor = NULL; // defensive
-        }
-    }
-
-    void ClientCursorPin::deleteUnderlying() {
-        delete _cursor;
-        _cursor = NULL;
-    }
-
-    ClientCursor* ClientCursorPin::c() const {
-        return _cursor;
-    }
-
-    //
-    // ClientCursorMonitor
-    //
-
-    // Used by sayMemoryStatus below.
-    struct Mem { 
-        Mem() { res = virt = mapped = 0; }
-        long long res;
-        long long virt;
-        long long mapped;
-        bool grew(const Mem& r) { 
-            return (r.res && (((double)res)/r.res)>1.1 ) ||
-              (r.virt && (((double)virt)/r.virt)>1.1 ) ||
-              (r.mapped && (((double)mapped)/r.mapped)>1.1 );
-        }
-    };
-
-    /**
-     * called once a minute from killcursors thread
-     */
-    void sayMemoryStatus() { 
-        static time_t last;
-        static Mem mlast;
-        try {
-            ProcessInfo p;
-            if (!serverGlobalParams.quiet && p.supported()) {
-                Mem m;
-                m.res = p.getResidentSize();
-                m.virt = p.getVirtualMemorySize();
-                m.mapped = MemoryMappedFile::totalMappedLength() / (1024 * 1024);
-                time_t now = time(0);
-                if( now - last >= 300 || m.grew(mlast) ) { 
-                    log() << "mem (MB) res:" << m.res << " virt:" << m.virt;
-                    long long totalMapped = m.mapped;
-                    if (storageGlobalParams.dur) {
-                        totalMapped *= 2;
-                        log() << " mapped (incl journal view):" << totalMapped;
-                    }
-                    else {
-                        log() << " mapped:" << totalMapped;
-                    }
-                    log() << " connections:" << Listener::globalTicketHolder.used();
-                    if (theReplSet) {
-                        log() << " replication threads:" << 
-                            ReplSetImpl::replWriterThreadCount + 
-                            ReplSetImpl::replPrefetcherThreadCount;
-                    }
-                    last = now;
-                    mlast = m;
-                }
-            }
-        }
-        catch(const std::exception&) {
-            log() << "ProcessInfo exception" << endl;
-        }
-    }
-
-    void ClientCursorMonitor::run() {
-        Client::initThread("clientcursormon");
-        Client& client = cc();
-        Timer t;
-        const int Secs = 4;
-        unsigned n = 0;
-        while ( ! inShutdown() ) {
-            cursorStatsTimedOut.increment( CollectionCursorCache::timeoutCursorsGlobal( t.millisReset() ) );
-            sleepsecs(Secs);
-            if( ++n % (60/Secs) == 0 /*once a minute*/ ) {
-                sayMemoryStatus();
-            }
-        }
-        client.shutdown();
-    }
-
-    ClientCursorMonitor clientCursorMonitor;
-
-    //
-    // cursorInfo command.
-    //
-
-    void _appendCursorStats( BSONObjBuilder& b ) {
-        b.append( "note" , "deprecated, use server status metrics" );
-
-        b.appendNumber("clientCursors_size", cursorStatsOpen.get() );
-        b.appendNumber("totalOpen", cursorStatsOpen.get() );
-        b.appendNumber("pinned", cursorStatsOpenPinned.get() );
-        b.appendNumber("totalNoTimeout", cursorStatsOpenNoTimeout.get() );
-
-        b.appendNumber("timedOut" , cursorStatsTimedOut.get());
-    }
-
-    // QUESTION: Restrict to the namespace from which this command was issued?
-    // Alternatively, make this command admin-only?
-    // TODO: remove this for 2.8
-    class CmdCursorInfo : public Command {
-    public:
-        CmdCursorInfo() : Command( "cursorInfo", true ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual void help( stringstream& help ) const {
-            help << " example: { cursorInfo : 1 }, deprecated";
-        }
-        virtual LockType locktype() const { return NONE; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::cursorInfo);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-        bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result,
-                 bool fromRepl ) {
-            _appendCursorStats( result );
-            return true;
-        }
-    } cmdCursorInfo;
-
-    //
-    // cursors stats.
-    //
-
-    class CursorServerStats : public ServerStatusSection {
-    public:
-        CursorServerStats() : ServerStatusSection( "cursors" ){}
-        virtual bool includeByDefault() const { return true; }
-
-        BSONObj generateSection(const BSONElement& configElement) const {
-            BSONObjBuilder b;
-            _appendCursorStats( b );
-            return b.obj();
-        }
-    } cursorServerStats;
-
-} // namespace mongo
+}  // namespace mongo

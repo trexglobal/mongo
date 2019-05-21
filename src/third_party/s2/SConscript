@@ -1,25 +1,34 @@
 # -*- mode: python -*-
 
-Import("env windows linux darwin solaris use_clang")
+Import("env")
 
 env = env.Clone()
 
-env.SConscript( [
-	"base/SConscript",
-	"strings/SConscript",
-	"util/coding/SConscript",
-	"util/math/SConscript",
-        ] )
+env.SConscript(
+    dirs=[
+        "base",
+        "strings",
+        "util/coding",
+        "util/math",
+    ],
+    exports=[
+        'env',
+    ],
+)
 
-env.Append(CCFLAGS=['-Isrc/third_party/s2'])
 env.Append(CCFLAGS=['-DDEBUG_MODE=false'])
 
 # Clang warns about struct/class tag mismatch, but as long as this is
 # not a problem on Windows, these mismatches can be ignored
 # http://stackoverflow.com/questions/4866425/mixing-class-and-struct. W
 # warning so it doesn't become an error.
-if use_clang:
+if env.ToolchainIs('clang'):
     env.Append(CCFLAGS=['-Wno-mismatched-tags'])
+
+if env.TargetOSIs('windows'):
+    # C4996: 'memccpy': The POSIX name for this item is deprecated. Instead, use the ISO C and C++
+    # conformant name: _memccpy. See online help for details
+    env.Append(CCFLAGS=['/wd4996'])
 
 env.Library( "s2",
     [ 
@@ -44,7 +53,7 @@ env.Library( "s2",
 	"s2regioncoverer.cc",
 	"s2regionintersection.cc",
 	"s2regionunion.cc",
-    ], LIBDEPS=['$BUILD_DIR/third_party/s2/base/base',
+    ], LIBDEPS=['$BUILD_DIR/third_party/s2/base/base_s2',
 		'$BUILD_DIR/third_party/s2/strings/strings',
 		'$BUILD_DIR/third_party/s2/util/coding/coding',
 		'$BUILD_DIR/third_party/s2/util/math/math'])

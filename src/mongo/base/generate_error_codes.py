@@ -1,20 +1,31 @@
-#!/usr/bin/python
-
-#    Copyright 2012 10gen Inc.
+#!/usr/bin/env python3
 #
-#    Licensed under the Apache License, Version 2.0 (the "License");
-#    you may not use this file except in compliance with the License.
-#    You may obtain a copy of the License at
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS,
-#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#    See the License for the specific language governing permissions and
-#    limitations under the License.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# Server Side Public License for more details.
 #
-
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 """Generate error_codes.{h,cpp} from error_codes.err.
 
 Format of error_codes.err:
@@ -25,19 +36,83 @@ error_code("symbol2", code2)
 error_class("class1", ["symbol1", "symbol2, ..."])
 
 Usage:
-    python generate_error_codes.py <path to error_codes.err> <header file path> <source file path>
+    python generate_error_codes.py <path to error_codes.err> <template>=<output>...
 """
 
+usage_msg = "usage: %prog /path/to/error_codes.err <template>=<output>..."
+
+from collections import namedtuple
+from Cheetah.Template import Template
 import sys
 
-def main(argv):
-    if len(argv) != 4:
-        usage("Wrong number of arguments.")
 
+def render_template(template_path, **kw):
+    '''Renders the template file located at template_path, using the variables defined by kw, and
+       returns the result as a string'''
+
+    template = Template.compile(
+        file=template_path,
+        compilerSettings=dict(directiveStartToken="//#", directiveEndToken="//#",
+                              commentStartToken="//##"), baseclass=dict, useCache=False)
+    return str(template(**kw))
+
+
+class ErrorCode:
+    def __init__(self, name, code, extra=None):
+        self.name = name
+        self.code = code
+        self.extra = extra
+        if extra:
+            split = extra.split('::')
+            if not split[0]:
+                die("Error for %s with extra info %s: fully qualified namespaces aren't supported" %
+                    (name, extra))
+            if split[0] == "mongo":
+                die("Error for %s with extra info %s: don't include the mongo namespace" % (name,
+                                                                                            extra))
+            if len(split) > 1:
+                self.extra_class = split.pop()
+                self.extra_ns = "::".join(split)
+            else:
+                self.extra_class = extra
+                self.extra_ns = None
+        self.categories = []
+
+
+class ErrorClass:
+    def __init__(self, name, codes):
+        self.name = name
+        self.codes = codes
+
+
+def main(argv):
+    # Parse and validate argv.
+    if len(sys.argv) < 2:
+        usage("Must specify error_codes.err")
+    if len(sys.argv) < 3:
+        usage("Must specify at least one template=output pair")
+
+    template_outputs = []
+    for arg in sys.argv[2:]:
+        try:
+            template, output = arg.split('=', 1)
+            template_outputs.append((template, output))
+        except Exception:
+            usage("Error parsing template=output pair: " + arg)
+
+    # Parse and validate error_codes.err.
     error_codes, error_classes = parse_error_definitions_from_file(argv[1])
     check_for_conflicts(error_codes, error_classes)
-    generate_header(argv[2], error_codes, error_classes)
-    generate_source(argv[3], error_codes, error_classes)
+
+    # Render the templates to the output files.
+    for template, output in template_outputs:
+        text = render_template(template,
+                codes=error_codes,
+                categories=error_classes,
+                )
+
+        with open(output, 'w') as outfile:
+            outfile.write(text)
 
 def die(message=None):
     sys.stderr.write(message or "Fatal error\n")
@@ -52,9 +127,11 @@ def parse_error_definitions_from_file(errors_filename):
     errors_code = compile(errors_file.read(), errors_filename, 'exec')
     error_codes = []
     error_classes = []
-    eval(errors_code, dict(error_code=lambda *args: error_codes.append(args),
-                           error_class=lambda *args: error_classes.append(args)))
-    error_codes.sort(key=lambda x: x[1])
+    eval(errors_code,
+            dict(error_code=lambda *args, **kw: error_codes.append(ErrorCode(*args, **kw)),
+                 error_class=lambda *args: error_classes.append(ErrorClass(*args))))
+    error_codes.sort(key=lambda x: x.code)
+
     return error_codes, error_classes
 
 def check_for_conflicts(error_codes, error_classes):
@@ -66,29 +143,33 @@ def check_for_conflicts(error_codes, error_classes):
     if failed:
         die()
 
+
 def has_duplicate_error_codes(error_codes):
-    sorted_by_name = sorted(error_codes, key=lambda x: x[0])
-    sorted_by_code = sorted(error_codes, key=lambda x: x[1])
+    sorted_by_name = sorted(error_codes, key=lambda x: x.name)
+    sorted_by_code = sorted(error_codes, key=lambda x: x.code)
 
     failed = False
-    prev_name, prev_code = sorted_by_name[0]
-    for name, code in sorted_by_name[1:]:
-        if name == prev_name:
-            sys.stdout.write('Duplicate name %s with codes %s and %s\n' % (name, code, prev_code))
+    prev = sorted_by_name[0]
+    for curr in sorted_by_name[1:]:
+        if curr.name == prev.name:
+            sys.stdout.write(
+                'Duplicate name %s with codes %s and %s\n' % (curr.name, curr.code, prev.code))
             failed = True
-        prev_name, prev_code = name, code
+        prev = curr
 
-    prev_name, prev_code = sorted_by_code[0]
-    for name, code in sorted_by_code[1:]:
-        if code == prev_code:
-            sys.stdout.write('Duplicate code %s with names %s and %s\n' % (code, name, prev_name))
+    prev = sorted_by_code[0]
+    for curr in sorted_by_code[1:]:
+        if curr.code == prev.code:
+            sys.stdout.write(
+                'Duplicate code %s with names %s and %s\n' % (curr.code, curr.name, prev.name))
             failed = True
-        prev_name, prev_code = name, code
+        prev = curr
 
     return failed
 
+
 def has_duplicate_error_classes(error_classes):
-    names = sorted(ec[0] for ec in error_classes)
+    names = sorted(ec.name for ec in error_classes)
 
     failed = False
     prev_name = names[0]
@@ -99,165 +180,20 @@ def has_duplicate_error_classes(error_classes):
         prev_name = name
     return failed
 
+
 def has_missing_error_codes(error_codes, error_classes):
-    code_names = set(ec[0] for ec in error_codes)
+    code_names = dict((ec.name, ec) for ec in error_codes)
     failed = False
-    for class_name, class_code_names in error_classes:
-        for name in class_code_names:
-            if name not in code_names:
-                sys.stdout.write('Undeclared error code %s in class %s\n' % (name, class_name))
+    for category in error_classes:
+        for name in category.codes:
+            try:
+                code_names[name].categories.append(category.name)
+            except KeyError:
+                sys.stdout.write('Undeclared error code %s in class %s\n' % (name, category.name))
                 failed = True
+
     return failed
 
-def generate_header(filename, error_codes, error_classes):
 
-    enum_declarations = ',\n            '.join('%s = %s' % ec for ec in error_codes)
-    predicate_declarations = ';\n        '.join(
-        'static bool is%s(Error err)' % ec[0] for ec in error_classes)
-
-    open(filename, 'wb').write(header_template % dict(
-            error_code_enum_declarations=enum_declarations,
-            error_code_class_predicate_declarations=predicate_declarations))
-
-def generate_source(filename, error_codes, error_classes):
-    symbol_to_string_cases = ';\n        '.join(
-        'case %s: return "%s"' % (ec[0], ec[0]) for ec in error_codes)
-    string_to_symbol_cases = ';\n        '.join(
-        'if (name == "%s") return %s' % (ec[0], ec[0])
-        for ec in error_codes)
-    int_to_symbol_cases = ';\n        '.join(
-        'case %s: return %s' % (ec[0], ec[0]) for ec in error_codes)
-    predicate_definitions = '\n    '.join(
-        generate_error_class_predicate_definition(*ec) for ec in error_classes)
-    open(filename, 'wb').write(source_template % dict(
-            symbol_to_string_cases=symbol_to_string_cases,
-            string_to_symbol_cases=string_to_symbol_cases,
-            int_to_symbol_cases=int_to_symbol_cases,
-            error_code_class_predicate_definitions=predicate_definitions))
-
-def generate_error_class_predicate_definition(class_name, code_names):
-    cases = '\n        '.join('case %s:' % c for c in code_names)
-    return error_class_predicate_template % dict(class_name=class_name, cases=cases)
-
-header_template = '''// AUTO-GENERATED FILE DO NOT EDIT
-// See src/mongo/base/generate_error_codes.py
-/*    Copyright 2012 10gen Inc.
- *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
- */
-
-#pragma once
-
-#include <string>
-
-#include "mongo/base/string_data.h"
-#include "mongo/client/export_macros.h"
-
-namespace mongo {
-
-    /**
-     * This is a generated class containing a table of error codes and their corresponding error
-     * strings. The class is derived from the definitions in src/mongo/base/error_codes.err file.
-     *
-     * Do not update this file directly. Update src/mongo/base/error_codes.err instead.
-     */
-
-    class MONGO_CLIENT_API ErrorCodes {
-    public:
-        enum Error {
-            %(error_code_enum_declarations)s,
-            MaxError
-        };
-
-        static std::string errorString(Error err);
-
-        /**
-         * Parses an Error from its "name".  Returns UnknownError if "name" is unrecognized.
-         *
-         * NOTE: Also returns UnknownError for the string "UnknownError".
-         */
-        static Error fromString(const StringData& name);
-
-        /**
-         * Casts an integer "code" to an Error.  Unrecognized codes are preserved, meaning
-         * that the result of a call to fromInt() may not be one of the values in the
-         * Error enumeration.
-         */
-        static Error fromInt(int code);
-
-        %(error_code_class_predicate_declarations)s;
-    };
-
-}  // namespace mongo
-'''
-
-source_template = '''// AUTO-GENERATED FILE DO NOT EDIT
-// See src/mongo/base/generate_error_codes.py
-/*    Copyright 2012 10gen Inc.
- *
- *    Licensed under the Apache License, Version 2.0 (the "License");
- *    you may not use this file except in compliance with the License.
- *    You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- *    Unless required by applicable law or agreed to in writing, software
- *    distributed under the License is distributed on an "AS IS" BASIS,
- *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *    See the License for the specific language governing permissions and
- *    limitations under the License.
- */
-
-#include "mongo/base/error_codes.h"
-
-#include <boost/static_assert.hpp>
-
-#include "mongo/util/mongoutils/str.h"
-
-namespace mongo {
-
-    std::string ErrorCodes::errorString(Error err) {
-        switch (err) {
-        %(symbol_to_string_cases)s;
-        default: return mongoutils::str::stream() << "Location" << err;
-        }
-    }
-
-    ErrorCodes::Error ErrorCodes::fromString(const StringData& name) {
-        %(string_to_symbol_cases)s;
-        return UnknownError;
-    }
-
-    ErrorCodes::Error ErrorCodes::fromInt(int code) {
-        return static_cast<Error>(code);
-    }
-
-    %(error_code_class_predicate_definitions)s
-
-namespace {
-    BOOST_STATIC_ASSERT(sizeof(ErrorCodes::Error) == sizeof(int));
-}  // namespace
-}  // namespace mongo
-'''
-
-error_class_predicate_template = '''bool ErrorCodes::is%(class_name)s(Error err) {
-        switch (err) {
-        %(cases)s
-            return true;
-        default:
-            return false;
-        }
-    }
-'''
 if __name__ == '__main__':
     main(sys.argv)

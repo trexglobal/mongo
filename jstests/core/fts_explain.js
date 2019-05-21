@@ -1,18 +1,39 @@
+// Cannot implicitly shard accessed collections because of extra shard key index in sharded
+// collection.
+// @tags: [assumes_no_implicit_index_creation]
+
 // Test $text explain.  SERVER-12037.
 
-var coll = db.fts_explain;
+(function() {
+    "use strict";
 
-coll.drop();
-coll.ensureIndex({content: "text"}, {default_language: "none"});
-assert.gleSuccess(db);
+    const coll = db.fts_explain;
+    let res;
 
-coll.insert({content: "some data"});
-assert.gleSuccess(db);
+    coll.drop();
+    res = coll.ensureIndex({content: "text"}, {default_language: "none"});
+    assert.commandWorked(res);
 
-var explain = coll.find({$text:{$search: "\"a\" -b -\"c\""}}).explain(true);
-assert.eq(explain.cursor, "TextCursor");
-assert.eq(explain.stats.type, "TEXT");
-assert.eq(explain.stats.parsedTextQuery.terms, ["a"]);
-assert.eq(explain.stats.parsedTextQuery.negatedTerms, ["b"]);
-assert.eq(explain.stats.parsedTextQuery.phrases, ["a"]);
-assert.eq(explain.stats.parsedTextQuery.negatedPhrases, ["c"]);
+    res = coll.insert({content: "some data"});
+    assert.writeOK(res);
+
+    const explain =
+        coll.find({$text: {$search: "\"a\" -b -\"c\""}}, {content: 1, score: {$meta: "textScore"}})
+            .explain(true);
+    let stage = explain.executionStats.executionStages;
+    if ("SINGLE_SHARD" === stage.stage) {
+        stage = stage.shards[0].executionStages;
+    }
+
+    assert.eq(stage.stage, "PROJECTION_DEFAULT");
+
+    let textStage = stage.inputStage;
+    assert.eq(textStage.stage, "TEXT");
+    assert.gte(textStage.textIndexVersion, 1, "textIndexVersion incorrect or missing.");
+    assert.eq(textStage.inputStage.stage, "TEXT_MATCH");
+    assert.eq(textStage.inputStage.inputStage.stage, "TEXT_OR");
+    assert.eq(textStage.parsedTextQuery.terms, ["a"]);
+    assert.eq(textStage.parsedTextQuery.negatedTerms, ["b"]);
+    assert.eq(textStage.parsedTextQuery.phrases, ["a"]);
+    assert.eq(textStage.parsedTextQuery.negatedPhrases, ["c"]);
+})();

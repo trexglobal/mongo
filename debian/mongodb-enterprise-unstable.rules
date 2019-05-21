@@ -1,6 +1,6 @@
 #!/usr/bin/make -f
 # -*- makefile -*-
-TOOLS=bsondump mongodump mongoexport mongofiles mongoimport mongooplog mongoperf mongorestore mongostat mongotop
+TOOLS=bsondump mongodecrypt mongodump mongoexport mongofiles mongoimport mongoldap mongorestore mongostat mongotop
 
 # Uncomment this to turn on verbose mode.
 export DH_VERBOSE=1
@@ -25,7 +25,10 @@ build-stamp: configure-stamp
 	echo -n > debian/mongodb-enterprise-unstable-tools.manpages
 	for binary in ${TOOLS} ; \
 	do \
-	  echo debian/$$binary.1 >> debian/mongodb-enterprise-unstable-tools.manpages ; \
+		if [ -e debian/$$binary.1 ] ; \
+		then \
+			echo debian/$$binary.1 >> debian/mongodb-enterprise-tools.manpages ; \
+		fi ; \
 	done
 
 	echo debian/mongo.1 > debian/mongodb-enterprise-unstable-shell.manpages
@@ -53,11 +56,13 @@ clean:
 	rm -f config.log
 	rm -f mongo
 	rm -f mongod
+	rm -f mongocryptd
 	rm -f mongoimportjson
 	rm -f mongoexport
 	rm -f mongorestore
 	rm -f mongodump
 	rm -f mongofiles
+	rm -f install_compass
 	rm -f .sconsign.dblite
 	rm -f libmongoclient.a
 	rm -rf client/*.o
@@ -83,7 +88,9 @@ install: build
 	mkdir -p $(CURDIR)/debian/mongodb-enterprise-unstable-tools/usr/bin
 	cp -v $(CURDIR)/bin/mongo $(CURDIR)/debian/mongodb-enterprise-unstable-shell/usr/bin
 	cp -v $(CURDIR)/bin/mongod $(CURDIR)/debian/mongodb-enterprise-unstable-server/usr/bin
+	cp -v $(CURDIR)/bin/mongocryptd $(CURDIR)/debian/mongodb-enterprise-unstable-server/usr/bin
 	cp -v $(CURDIR)/bin/mongos $(CURDIR)/debian/mongodb-enterprise-unstable-mongos/usr/bin
+	cp -v $(CURDIR)/bin/install_compass $(CURDIR)/debian/mongodb-enterprise-unstable-tools/usr/bin
 
 	for binary in ${TOOLS} ; \
 	do \

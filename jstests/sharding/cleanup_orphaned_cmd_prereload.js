@@ -2,97 +2,94 @@
 // Tests failed cleanup of orphaned data when we have pending chunks
 //
 
-var options = { separateConfig : true, shardOptions : { verbose : 2 } };
-
-var st = new ShardingTest({ shards : 2, mongos : 2, other : options });
-st.stopBalancer();
+var st = new ShardingTest({shards: 2});
 
 var mongos = st.s0;
-var admin = mongos.getDB( "admin" );
-var shards = mongos.getCollection( "config.shards" ).find().toArray();
-var coll = mongos.getCollection( "foo.bar" );
+var admin = mongos.getDB("admin");
+var coll = mongos.getCollection("foo.bar");
 
-assert( admin.runCommand({ enableSharding : coll.getDB() + "" }).ok );
-printjson( admin.runCommand({ movePrimary : coll.getDB() + "", to : shards[0]._id }) );
-assert( admin.runCommand({ shardCollection : coll + "", key : { _id : 1 } }).ok );
+assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
+printjson(admin.runCommand({movePrimary: coll.getDB() + "", to: st.shard0.shardName}));
+assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
 
-jsTest.log( "Moving some chunks to shard1..." );
+// Turn off best-effort recipient metadata refresh post-migration commit on both shards because it
+// would clean up the pending chunks on migration recipients.
+assert.commandWorked(st.shard0.getDB('admin').runCommand(
+    {configureFailPoint: 'doNotRefreshRecipientAfterCommit', mode: 'alwaysOn'}));
+assert.commandWorked(st.shard1.getDB('admin').runCommand(
+    {configureFailPoint: 'doNotRefreshRecipientAfterCommit', mode: 'alwaysOn'}));
 
-assert( admin.runCommand({ split : coll + "", middle : { _id : 0 } }).ok );
-assert( admin.runCommand({ split : coll + "", middle : { _id : 1 } }).ok );
+jsTest.log("Moving some chunks to shard1...");
 
-assert( admin.runCommand({ moveChunk : coll + "", 
-                           find : { _id : 0 }, 
-                           to : shards[1]._id,
-                           _waitForDelete : true }).ok );
-assert( admin.runCommand({ moveChunk : coll + "", 
-                           find : { _id : 1 }, 
-                           to : shards[1]._id,
-                           _waitForDelete : true }).ok );
+assert.commandWorked(admin.runCommand({split: coll + "", middle: {_id: 0}}));
+assert.commandWorked(admin.runCommand({split: coll + "", middle: {_id: 1}}));
 
-var metadata = st.shard1.getDB( "admin" )
-                   .runCommand({ getShardVersion : coll + "", fullMetadata : true }).metadata;
+assert.commandWorked(admin.runCommand(
+    {moveChunk: coll + "", find: {_id: 0}, to: st.shard1.shardName, _waitForDelete: true}));
+assert.commandWorked(admin.runCommand(
+    {moveChunk: coll + "", find: {_id: 1}, to: st.shard1.shardName, _waitForDelete: true}));
 
-printjson( metadata );
+var metadata =
+    st.shard1.getDB("admin").runCommand({getShardVersion: coll + "", fullMetadata: true}).metadata;
 
-assert.eq( metadata.pending[0][0]._id, 1 );
-assert.eq( metadata.pending[0][1]._id, MaxKey );
+printjson(metadata);
 
-jsTest.log( "Ensuring we won't remove orphaned data in pending chunk..." );
+assert.eq(metadata.pending[0][0]._id, 1);
+assert.eq(metadata.pending[0][1]._id, MaxKey);
 
-assert( !st.shard1.getDB( "admin" )
-        .runCommand({ cleanupOrphaned : coll + "", startingFromKey : { _id : 1 } }).stoppedAtKey );
+jsTest.log("Ensuring we won't remove orphaned data in pending chunk...");
 
-jsTest.log( "Moving some chunks back to shard0 after empty..." );
+assert(!st.shard1.getDB("admin")
+            .runCommand({cleanupOrphaned: coll + "", startingFromKey: {_id: 1}})
+            .stoppedAtKey);
 
-admin.runCommand({ moveChunk : coll + "",
-                   find : { _id : -1 },
-                   to : shards[1]._id,
-                   _waitForDelete : true });
+jsTest.log("Moving some chunks back to shard0 after empty...");
 
-var metadata = st.shard0.getDB( "admin" )
-                   .runCommand({ getShardVersion : coll + "", fullMetadata : true }).metadata;
+assert.commandWorked(admin.runCommand(
+    {moveChunk: coll + "", find: {_id: -1}, to: st.shard1.shardName, _waitForDelete: true}));
 
-printjson( metadata );
+var metadata =
+    st.shard0.getDB("admin").runCommand({getShardVersion: coll + "", fullMetadata: true}).metadata;
 
-assert.eq( metadata.shardVersion.t, 0 );
-assert.neq( metadata.collVersion.t, 0 );
-assert.eq( metadata.pending.length, 0 );
+printjson(metadata);
 
-assert( admin.runCommand({ moveChunk : coll + "", 
-                           find : { _id : 1 }, 
-                           to : shards[0]._id,
-                           _waitForDelete : true }).ok );
+assert.eq(metadata.shardVersion.t, 0);
+assert.neq(metadata.collVersion.t, 0);
+assert.eq(metadata.pending.length, 0);
 
-var metadata = st.shard0.getDB( "admin" )
-                   .runCommand({ getShardVersion : coll + "", fullMetadata : true }).metadata;
+assert.commandWorked(admin.runCommand(
+    {moveChunk: coll + "", find: {_id: 1}, to: st.shard0.shardName, _waitForDelete: true}));
 
-printjson( metadata );
-assert.eq( metadata.shardVersion.t, 0 );
-assert.neq( metadata.collVersion.t, 0 );
-assert.eq( metadata.pending[0][0]._id, 1 );
-assert.eq( metadata.pending[0][1]._id, MaxKey );
+var metadata =
+    st.shard0.getDB("admin").runCommand({getShardVersion: coll + "", fullMetadata: true}).metadata;
 
-jsTest.log( "Ensuring again we won't remove orphaned data in pending chunk..." );
+printjson(metadata);
+assert.eq(metadata.shardVersion.t, 0);
+assert.neq(metadata.collVersion.t, 0);
+assert.eq(metadata.pending[0][0]._id, 1);
+assert.eq(metadata.pending[0][1]._id, MaxKey);
 
-assert( !st.shard0.getDB( "admin" )
-        .runCommand({ cleanupOrphaned : coll + "", startingFromKey : { _id : 1 } }).stoppedAtKey );
+jsTest.log("Ensuring again we won't remove orphaned data in pending chunk...");
 
-jsTest.log( "Checking that pending chunk is promoted on reload..." );
+assert(!st.shard0.getDB("admin")
+            .runCommand({cleanupOrphaned: coll + "", startingFromKey: {_id: 1}})
+            .stoppedAtKey);
 
-assert.eq( null, coll.findOne({ _id : 1 }) );
+jsTest.log("Checking that pending chunk is promoted on reload...");
 
-var metadata = st.shard0.getDB( "admin" )
-                   .runCommand({ getShardVersion : coll + "", fullMetadata : true }).metadata;
+assert.eq(null, coll.findOne({_id: 1}));
 
-printjson( metadata );
-assert.neq( metadata.shardVersion.t, 0 );
-assert.neq( metadata.collVersion.t, 0 );
-assert.eq( metadata.chunks[0][0]._id, 1 );
-assert.eq( metadata.chunks[0][1]._id, MaxKey );
+var metadata =
+    st.shard0.getDB("admin").runCommand({getShardVersion: coll + "", fullMetadata: true}).metadata;
+
+printjson(metadata);
+assert.neq(metadata.shardVersion.t, 0);
+assert.neq(metadata.collVersion.t, 0);
+assert.eq(metadata.chunks[0][0]._id, 1);
+assert.eq(metadata.chunks[0][1]._id, MaxKey);
 
 st.printShardingStatus();
 
-jsTest.log( "DONE!" );
+jsTest.log("DONE!");
 
 st.stop();

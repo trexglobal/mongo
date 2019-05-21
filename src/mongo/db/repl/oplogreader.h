@@ -1,166 +1,115 @@
-/** @file oplogreader.h */
-
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 
 #pragma once
 
-#include "mongo/client/constants.h"
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_connection.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
+namespace repl {
 
-    extern const BSONObj reverseNaturalObj; // { $natural : -1 }
-    /**
-     * Authenticates conn using the server's cluster-membership credentials.
-     *
-     * Returns true on successful authentication.
-     */
-    bool replAuthenticate(DBClientBase* conn);
+/**
+ * Authenticates conn using the server's cluster-membership credentials.
+ *
+ * Returns true on successful authentication.
+ */
+bool replAuthenticate(DBClientBase* conn);
 
-    /* started abstracting out the querying of the primary/master's oplog
-       still fairly awkward but a start.
-    */
+/* started abstracting out the querying of the primary/master's oplog
+   still fairly awkward but a start.
+*/
 
-    class OplogReader {
-        shared_ptr<DBClientConnection> _conn;
-        shared_ptr<DBClientCursor> cursor;
-        int _tailingQueryOptions;
-    public:
-        OplogReader();
-        ~OplogReader() { }
-        void resetCursor() { cursor.reset(); }
-        void resetConnection() {
-            cursor.reset();
-            _conn.reset();
-        }
-        DBClientConnection* conn() { return _conn.get(); }
-        BSONObj findOne(const char *ns, const Query& q) {
-            return conn()->findOne(ns, q, 0, QueryOption_SlaveOk);
-        }
-        BSONObj getLastOp(const char *ns) {
-            return findOne(ns, Query().sort(reverseNaturalObj));
-        }
+class OplogReader {
+private:
+    std::shared_ptr<DBClientConnection> _conn;
+    std::shared_ptr<DBClientCursor> cursor;
+    int _tailingQueryOptions;
 
-        /* SO_TIMEOUT (send/recv time out) for our DBClientConnections */
-        static const int tcp_timeout = 30;
+    // If _conn was actively connected, _host represents the current HostAndPort of the
+    // connection.
+    HostAndPort _host;
 
-        /* ok to call if already connected */
-        bool connect(const std::string& hostname);
+public:
+    OplogReader();
+    ~OplogReader() {}
+    void resetCursor() {
+        cursor.reset();
+    }
+    void resetConnection() {
+        cursor.reset();
+        _conn.reset();
+        _host = HostAndPort();
+    }
+    DBClientConnection* conn() {
+        return _conn.get();
+    }
+    BSONObj findOne(const char* ns, const Query& q) {
+        return conn()->findOne(ns, q, 0, QueryOption_SlaveOk);
+    }
+    BSONObj findOneByUUID(const std::string& db, UUID uuid, const BSONObj& filter) {
+        // Note that the findOneByUUID() function of DBClient passes SlaveOK to the client.
+        BSONObj foundDoc;
+        std::tie(foundDoc, std::ignore) = conn()->findOneByUUID(db, uuid, filter);
+        return foundDoc;
+    }
 
-        bool connect(const std::string& hostname, const BSONObj& me);
+    /* SO_TIMEOUT (send/recv time out) for our DBClientConnections */
+    static const Seconds kSocketTimeout;
 
-        bool connect(const mongo::OID& rid, const int from, const string& to);
+    /* ok to call if already connected */
+    bool connect(const HostAndPort& host);
 
-        void tailCheck() {
-            if( cursor.get() && cursor->isDead() ) {
-                log() << "repl: old cursor isDead, will initiate a new one" << endl;
-                resetCursor();
-            }
-        }
+    void tailCheck();
 
-        bool haveCursor() { return cursor.get() != 0; }
+    bool haveCursor() {
+        return cursor.get() != 0;
+    }
 
-        /** this is ok but commented out as when used one should consider if QueryOption_OplogReplay
-           is needed; if not fine, but if so, need to change.
-        *//*
-        void query(const char *ns, const BSONObj& query) {
-            verify( !haveCursor() );
-            cursor.reset( _conn->query(ns, query, 0, 0, 0, QueryOption_SlaveOk).release() );
-        }*/
+    void tailingQuery(const char* ns, const BSONObj& query);
 
-        /** this can be used; it is commented out as it does not indicate
-            QueryOption_OplogReplay and that is likely important.  could be uncommented
-            just need to add that.
-            */
-        /*
-        void queryGTE(const char *ns, OpTime t) {
-            BSONObjBuilder q;
-            q.appendDate("$gte", t.asDate());
-            BSONObjBuilder q2;
-            q2.append("ts", q.done());
-            query(ns, q2.done());
-        }
-        */
+    bool more() {
+        uassert(15910, "Doesn't have cursor for reading oplog", cursor.get());
+        return cursor->more();
+    }
 
-        void query(const char *ns,
-                   Query query,
-                   int nToReturn,
-                   int nToSkip,
-                   const BSONObj* fields=0);
+    bool moreInCurrentBatch() {
+        uassert(15911, "Doesn't have cursor for reading oplog", cursor.get());
+        return cursor->moreInCurrentBatch();
+    }
 
-        void tailingQuery(const char *ns, const BSONObj& query, const BSONObj* fields=0);
+    BSONObj nextSafe() {
+        return cursor->nextSafe();
+    }
+};
 
-        void tailingQueryGTE(const char *ns, OpTime t, const BSONObj* fields=0);
-
-        /* Do a tailing query, but only send the ts field back. */
-        void ghostQueryGTE(const char *ns, OpTime t) {
-            const BSONObj fields = BSON("ts" << 1 << "_id" << 0);
-            return tailingQueryGTE(ns, t, &fields);
-        }
-
-        bool more() {
-            uassert( 15910, "Doesn't have cursor for reading oplog", cursor.get() );
-            return cursor->more();
-        }
-
-        bool moreInCurrentBatch() {
-            uassert( 15911, "Doesn't have cursor for reading oplog", cursor.get() );
-            return cursor->moreInCurrentBatch();
-        }
-
-        int currentBatchMessageSize() {
-            if( NULL == cursor->getMessage() )
-                return 0;
-            return cursor->getMessage()->size();
-        }
-
-        /* old mongod's can't do the await flag... */
-        bool awaitCapable() {
-            return cursor->hasResultFlag(ResultFlag_AwaitCapable);
-        }
-
-        int getTailingQueryOptions() const { return _tailingQueryOptions; }
-        void setTailingQueryOptions( int tailingQueryOptions ) { _tailingQueryOptions = tailingQueryOptions; }
-
-        void peek(vector<BSONObj>& v, int n) {
-            if( cursor.get() )
-                cursor->peek(v,n);
-        }
-        BSONObj nextSafe() { return cursor->nextSafe(); }
-        BSONObj next() { return cursor->next(); }
-        void putBack(BSONObj op) { cursor->putBack(op); }
-        
-    private:
-        /** @return true iff connection was successful */ 
-        bool commonConnect(const string& hostName);
-        bool passthroughHandshake(const mongo::OID& rid, const int f);
-    };
-
-}
+}  // namespace repl
+}  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,13 +27,24 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
+#include "mongo/platform/basic.h"
+
+#include "mongo/base/init.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
 #include "mongo/db/exec/collection_scan.h"
+#include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/limit.h"
@@ -41,349 +53,455 @@
 #include "mongo/db/exec/skip.h"
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/exec/text.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/fts_access_method.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
-#include "mongo/db/pdfile.h"
+#include "mongo/db/matcher/expression_text_base.h"
+#include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
-    /**
-     * A command for manually constructing a query tree and running it.
-     *
-     * db.runCommand({stageDebug: rootNode})
-     *
-     * The value of the filter field is a BSONObj that specifies values that fields must have.  What
-     * you'd pass to a matcher.
-     *
-     * Leaf Nodes:
-     *
-     * node -> {ixscan: {filter: {FILTER},
-     *                   args: {name: "collectionname", indexKeyPattern: kpObj, start: startObj,
-     *                          stop: stopObj, endInclusive: true/false, direction: -1/1,
-     *                          limit: int}}}
-     * node -> {cscan: {filter: {filter}, args: {name: "collectionname", direction: -1/1}}}
-     * TODO: language for text.
-     * node -> {text: {filter: {filter}, args: {name: "collectionname", search: "searchstr"}}}
-     *
-     * Internal Nodes:
-     *
-     * node -> {andHash: {filter: {filter}, args: { nodes: [node, node]}}}
-     * node -> {andSorted: {filter: {filter}, args: { nodes: [node, node]}}}
-     * node -> {or: {filter: {filter}, args: { dedup:bool, nodes:[node, node]}}}
-     * node -> {fetch: {filter: {filter}, args: {node: node}}}
-     * node -> {limit: {args: {node: node, num: posint}}}
-     * node -> {skip: {args: {node: node, num: posint}}}
-     * node -> {sort: {args: {node: node, pattern: objWithSortCriterion }}}
-     * node -> {mergeSort: {args: {nodes: [node, node], pattern: objWithSortCriterion}}}
-     * node -> {cscan: {filter: {filter}, args: {name: "collectionname" }}}
-     *
-     * Forthcoming Nodes:
-     *
-     * node -> {dedup: {filter: {filter}, args: {node: node, field: field}}}
-     * node -> {unwind: {filter: filter}, args: {node: node, field: field}}
-     */
-    class StageDebugCmd : public Command {
-    public:
-        StageDebugCmd() : Command("stageDebug") { }
+using std::unique_ptr;
+using std::string;
+using std::vector;
+using stdx::make_unique;
 
-        // Boilerplate for commands
-        virtual LockType locktype() const { return READ; }
-        bool slaveOk() const { return true; }
-        bool slaveOverrideOk() const { return true; }
-        void help(std::stringstream& h) const { }
+namespace {
 
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::find);
-            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+BSONObj stripFieldNames(const BSONObj& obj) {
+    BSONObjIterator it(obj);
+    BSONObjBuilder bob;
+    while (it.more()) {
+        bob.appendAs(it.next(), "");
+    }
+    return bob.obj();
+}
+
+}  // namespace
+
+/**
+ * A command for manually constructing a query tree and running it.
+ *
+ * db.runCommand({stageDebug: {collection: collname, plan: rootNode}})
+ *
+ * The value of the filter field is a BSONObj that specifies values that fields must have.  What
+ * you'd pass to a matcher.
+ *
+ * Leaf Nodes:
+ *
+ * node -> {ixscan: {filter: {FILTER},
+ *                   args: {indexKeyPattern: kpObj, start: startObj,
+ *                          stop: stopObj, endInclusive: true/false, direction: -1/1,
+ *                          limit: int}}}
+ * node -> {cscan: {filter: {filter}, args: {direction: -1/1}}}
+ * TODO: language for text.
+ * node -> {text: {filter: {filter}, args: {search: "searchstr"}}}
+ *
+ * Internal Nodes:
+ *
+ * node -> {andHash: {args: { nodes: [node, node]}}}
+ * node -> {andSorted: {args: { nodes: [node, node]}}}
+ * node -> {or: {filter: {filter}, args: { dedup:bool, nodes:[node, node]}}}
+ * node -> {fetch: {filter: {filter}, args: {node: node}}}
+ * node -> {limit: {args: {node: node, num: posint}}}
+ * node -> {skip: {args: {node: node, num: posint}}}
+ * node -> {sort: {args: {node: node, pattern: objWithSortCriterion }}}
+ * node -> {mergeSort: {args: {nodes: [node, node], pattern: objWithSortCriterion}}}
+ * node -> {delete: {args: {node: node, isMulti: bool}}}
+ *
+ * Forthcoming Nodes:
+ *
+ * node -> {dedup: {filter: {filter}, args: {node: node, field: field}}}
+ * node -> {unwind: {filter: filter}, args: {node: node, field: field}}
+ */
+class StageDebugCmd : public BasicCommand {
+public:
+    StageDebugCmd() : BasicCommand("stageDebug") {}
+
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
+    }
+    std::string help() const override {
+        return {};
+    }
+
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) const {
+        // Command is testing-only, and can only be enabled at command line.  Hence, no auth
+        // check needed.
+    }
+
+    bool run(OperationContext* opCtx,
+             const string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) {
+        BSONElement argElt = cmdObj["stageDebug"];
+        if (argElt.eoo() || !argElt.isABSONObj()) {
+            return false;
+        }
+        BSONObj argObj = argElt.Obj();
+
+        // Pull out the collection name.
+        BSONElement collElt = argObj["collection"];
+        if (collElt.eoo() || (String != collElt.type())) {
+            return false;
         }
 
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result,
-                 bool fromRepl) {
+        const NamespaceString nss(dbname, collElt.String());
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << nss.toString() << " is not a valid namespace",
+                nss.isValid());
 
-            BSONElement argElt = cmdObj["stageDebug"];
-            if (argElt.eoo() || !argElt.isABSONObj()) { return false; }
-            BSONObj argObj = argElt.Obj();
+        // Need a context to get the actual Collection*
+        // TODO A write lock is currently taken here to accommodate stages that perform writes
+        //      (e.g. DeleteStage).  This should be changed to use a read lock for read-only
+        //      execution trees.
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
 
-            OwnedPointerVector<MatchExpression> exprs;
-            auto_ptr<WorkingSet> ws(new WorkingSet());
+        // Make sure the collection is valid.
+        Collection* collection = autoColl.getCollection();
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "Couldn't find collection " << nss.ns(),
+                collection);
 
-            PlanStage* userRoot = parseQuery(dbname, argObj, ws.get(), &exprs);
-            uassert(16911, "Couldn't parse plan from " + argObj.toString(), NULL != userRoot);
+        // Pull out the plan
+        BSONElement planElt = argObj["plan"];
+        if (planElt.eoo() || !planElt.isABSONObj()) {
+            return false;
+        }
+        BSONObj planObj = planElt.Obj();
 
-            // Add a fetch at the top for the user so we can get obj back for sure.
-            // TODO: Do we want to do this for the user?  I think so.
-            PlanStage* rootFetch = new FetchStage(ws.get(), userRoot, NULL);
+        // Parse the plan into these.
+        std::vector<std::unique_ptr<MatchExpression>> exprs;
+        unique_ptr<WorkingSet> ws(new WorkingSet());
 
-            PlanExecutor runner(ws.release(), rootFetch);
+        PlanStage* userRoot = parseQuery(opCtx, collection, planObj, ws.get(), &exprs);
+        uassert(16911, "Couldn't parse plan from " + cmdObj.toString(), NULL != userRoot);
 
-            BSONArrayBuilder resultBuilder(result.subarrayStart("results"));
+        // Add a fetch at the top for the user so we can get obj back for sure.
+        // TODO: Do we want to do this for the user?  I think so.
+        unique_ptr<PlanStage> rootFetch =
+            make_unique<FetchStage>(opCtx, ws.get(), userRoot, nullptr, collection);
 
-            for (BSONObj obj; Runner::RUNNER_ADVANCED == runner.getNext(&obj, NULL); ) {
-                resultBuilder.append(obj);
-            }
+        auto statusWithPlanExecutor = PlanExecutor::make(
+            opCtx, std::move(ws), std::move(rootFetch), collection, PlanExecutor::YIELD_AUTO);
+        fassert(28536, statusWithPlanExecutor.getStatus());
+        auto exec = std::move(statusWithPlanExecutor.getValue());
 
-            resultBuilder.done();
-            return true;
+        BSONArrayBuilder resultBuilder(result.subarrayStart("results"));
+
+        BSONObj obj;
+        PlanExecutor::ExecState state;
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+            resultBuilder.append(obj);
         }
 
-        PlanStage* parseQuery(const string& dbname, BSONObj obj, WorkingSet* workingSet,
-                              OwnedPointerVector<MatchExpression>* exprs) {
-            BSONElement firstElt = obj.firstElement();
-            if (!firstElt.isABSONObj()) { return NULL; }
-            BSONObj paramObj = firstElt.Obj();
+        resultBuilder.done();
 
-            MatchExpression* matcher = NULL;
-            BSONObj nodeArgs;
+        if (PlanExecutor::FAILURE == state) {
+            error() << "Plan executor error during StageDebug command: FAILURE, stats: "
+                    << redact(Explain::getWinningPlanStats(exec.get()));
 
-            // Every node has these two fields.
-            const string filterTag = "filter";
-            const string argsTag = "args";
+            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                "Executor error during StageDebug command"));
+        }
 
-            BSONObjIterator it(paramObj);
-            while (it.more()) {
-                BSONElement e = it.next();
-                if (!e.isABSONObj()) { return NULL; }
-                BSONObj argObj = e.Obj();
-                if (filterTag == e.fieldName()) {
-                    StatusWithMatchExpression swme = MatchExpressionParser::parse(argObj);
-                    if (!swme.isOK()) { return NULL; }
-                    // exprs is what will wind up deleting this.
-                    matcher = swme.getValue();
-                    verify(NULL != matcher);
-                    exprs->mutableVector().push_back(matcher);
-                }
-                else if (argsTag == e.fieldName()) {
-                    nodeArgs = argObj;
-                }
-                else {
-                    uasserted(16910, "Unknown fieldname " + string(e.fieldName())
-                                     + " in query node " + obj.toString());
+        return true;
+    }
+
+    PlanStage* parseQuery(OperationContext* opCtx,
+                          Collection* collection,
+                          BSONObj obj,
+                          WorkingSet* workingSet,
+                          std::vector<std::unique_ptr<MatchExpression>>* exprs) {
+        BSONElement firstElt = obj.firstElement();
+        if (!firstElt.isABSONObj()) {
+            return NULL;
+        }
+        BSONObj paramObj = firstElt.Obj();
+
+        MatchExpression* matcher = NULL;
+        BSONObj nodeArgs;
+
+        // Every node has these two fields.
+        const string filterTag = "filter";
+        const string argsTag = "args";
+
+        BSONObjIterator it(paramObj);
+        while (it.more()) {
+            BSONElement e = it.next();
+            if (!e.isABSONObj()) {
+                return NULL;
+            }
+            BSONObj argObj = e.Obj();
+            if (filterTag == e.fieldName()) {
+                const CollatorInterface* collator = nullptr;
+                const boost::intrusive_ptr<ExpressionContext> expCtx(
+                    new ExpressionContext(opCtx, collator));
+                auto statusWithMatcher =
+                    MatchExpressionParser::parse(argObj,
+                                                 expCtx,
+                                                 ExtensionsCallbackReal(opCtx, &collection->ns()),
+                                                 MatchExpressionParser::kAllowAllSpecialFeatures);
+                if (!statusWithMatcher.isOK()) {
                     return NULL;
                 }
-            }
-
-            string nodeName = firstElt.fieldName();
-
-            if ("ixscan" == nodeName) {
-
-                Database* db = cc().database();
-                Collection* collection = db->getCollection( dbname + "." + nodeArgs["name"].String() );
-                uassert(16913, "Can't find collection " + nodeArgs["name"].String(), collection);
-
-                IndexDescriptor* desc =
-                    collection->getIndexCatalog()->findIndexByKeyPattern(nodeArgs["keyPattern"].Obj());
-                uassert(16890, "Can't find index: " + nodeArgs["keyPattern"].Obj().toString(), desc );
-
-                IndexScanParams params;
-                params.descriptor = desc;
-                params.bounds.isSimpleRange = true;
-                params.bounds.startKey = nodeArgs["startKey"].Obj();
-                params.bounds.endKey = nodeArgs["endKey"].Obj();
-                params.bounds.endKeyInclusive = nodeArgs["endKeyInclusive"].Bool();
-                params.direction = nodeArgs["direction"].numberInt();
-
-                return new IndexScan(params, workingSet, matcher);
-            }
-            else if ("andHash" == nodeName) {
-                uassert(16921, "Nodes argument must be provided to AND",
-                        nodeArgs["nodes"].isABSONObj());
-
-                auto_ptr<AndHashStage> andStage(new AndHashStage(workingSet, matcher));
-
-                int nodesAdded = 0;
-                BSONObjIterator it(nodeArgs["nodes"].Obj());
-                while (it.more()) {
-                    BSONElement e = it.next();
-                    uassert(16922, "node of AND isn't an obj?: " + e.toString(),
-                            e.isABSONObj());
-
-                    PlanStage* subNode = parseQuery(dbname, e.Obj(), workingSet, exprs);
-                    uassert(16923, "Can't parse sub-node of AND: " + e.Obj().toString(),
-                            NULL != subNode);
-                    // takes ownership
-                    andStage->addChild(subNode);
-                    ++nodesAdded;
-                }
-
-                uassert(16927, "AND requires more than one child", nodesAdded >= 2);
-
-                return andStage.release();
-            }
-            else if ("andSorted" == nodeName) {
-                uassert(16924, "Nodes argument must be provided to AND",
-                        nodeArgs["nodes"].isABSONObj());
-
-                auto_ptr<AndSortedStage> andStage(new AndSortedStage(workingSet,
-                                                                     matcher));
-
-                int nodesAdded = 0;
-                BSONObjIterator it(nodeArgs["nodes"].Obj());
-                while (it.more()) {
-                    BSONElement e = it.next();
-                    uassert(16925, "node of AND isn't an obj?: " + e.toString(),
-                            e.isABSONObj());
-
-                    PlanStage* subNode = parseQuery(dbname, e.Obj(), workingSet, exprs);
-                    uassert(16926, "Can't parse sub-node of AND: " + e.Obj().toString(),
-                            NULL != subNode);
-                    // takes ownership
-                    andStage->addChild(subNode);
-                    ++nodesAdded;
-                }
-
-                uassert(16928, "AND requires more than one child", nodesAdded >= 2);
-
-                return andStage.release();
-            }
-            else if ("or" == nodeName) {
-                uassert(16934, "Nodes argument must be provided to AND",
-                        nodeArgs["nodes"].isABSONObj());
-                uassert(16935, "Dedup argument must be provided to OR",
-                        !nodeArgs["dedup"].eoo());
-                BSONObjIterator it(nodeArgs["nodes"].Obj());
-                auto_ptr<OrStage> orStage(new OrStage(workingSet, nodeArgs["dedup"].Bool(),
-                                                      matcher));
-                while (it.more()) {
-                    BSONElement e = it.next();
-                    if (!e.isABSONObj()) { return NULL; }
-                    PlanStage* subNode = parseQuery(dbname, e.Obj(), workingSet, exprs);
-                    uassert(16936, "Can't parse sub-node of OR: " + e.Obj().toString(),
-                            NULL != subNode);
-                    // takes ownership
-                    orStage->addChild(subNode);
-                }
-
-                return orStage.release();
-            }
-            else if ("fetch" == nodeName) {
-                uassert(16929, "Node argument must be provided to fetch",
-                        nodeArgs["node"].isABSONObj());
-                PlanStage* subNode = parseQuery(dbname, nodeArgs["node"].Obj(), workingSet, exprs);
-                return new FetchStage(workingSet, subNode, matcher);
-            }
-            else if ("limit" == nodeName) {
-                uassert(16937, "Limit stage doesn't have a filter (put it on the child)",
-                        NULL == matcher);
-                uassert(16930, "Node argument must be provided to limit",
-                        nodeArgs["node"].isABSONObj());
-                uassert(16931, "Num argument must be provided to limit",
-                        nodeArgs["num"].isNumber());
-                PlanStage* subNode = parseQuery(dbname, nodeArgs["node"].Obj(), workingSet, exprs);
-                return new LimitStage(nodeArgs["num"].numberInt(), workingSet, subNode);
-            }
-            else if ("skip" == nodeName) {
-                uassert(16938, "Skip stage doesn't have a filter (put it on the child)",
-                        NULL == matcher);
-                uassert(16932, "Node argument must be provided to skip",
-                        nodeArgs["node"].isABSONObj());
-                uassert(16933, "Num argument must be provided to skip",
-                        nodeArgs["num"].isNumber());
-                PlanStage* subNode = parseQuery(dbname, nodeArgs["node"].Obj(), workingSet, exprs);
-                return new SkipStage(nodeArgs["num"].numberInt(), workingSet, subNode);
-            }
-            else if ("cscan" == nodeName) {
-                CollectionScanParams params;
-
-                // What collection?
-                params.ns = dbname + "." + nodeArgs["name"].String();
-                uassert(16962, "Can't find collection " + nodeArgs["name"].String(),
-                        NULL != cc().database()->getCollection(params.ns));
-
-                // What direction?
-                uassert(16963, "Direction argument must be specified and be a number",
-                        nodeArgs["direction"].isNumber());
-                if (1 == nodeArgs["direction"].numberInt()) {
-                    params.direction = CollectionScanParams::FORWARD;
-                }
-                else {
-                    params.direction = CollectionScanParams::BACKWARD;
-                }
-
-                return new CollectionScan(params, workingSet, matcher);
-            }
-            // sort is disabled for now.
-#if 0
-            else if ("sort" == nodeName) {
-                uassert(16969, "Node argument must be provided to sort",
-                        nodeArgs["node"].isABSONObj());
-                uassert(16970, "Pattern argument must be provided to sort",
-                        nodeArgs["pattern"].isABSONObj());
-                PlanStage* subNode = parseQuery(dbname, nodeArgs["node"].Obj(), workingSet, exprs);
-                SortStageParams params;
-                params.pattern = nodeArgs["pattern"].Obj();
-                return new SortStage(params, workingSet, subNode);
-            }
-#endif
-            else if ("mergeSort" == nodeName) {
-                uassert(16971, "Nodes argument must be provided to sort",
-                        nodeArgs["nodes"].isABSONObj());
-                uassert(16972, "Pattern argument must be provided to sort",
-                        nodeArgs["pattern"].isABSONObj());
-
-                MergeSortStageParams params;
-                params.pattern = nodeArgs["pattern"].Obj();
-                // Dedup is true by default.
-
-                auto_ptr<MergeSortStage> mergeStage(new MergeSortStage(params, workingSet));
-
-                BSONObjIterator it(nodeArgs["nodes"].Obj());
-                while (it.more()) {
-                    BSONElement e = it.next();
-                    uassert(16973, "node of mergeSort isn't an obj?: " + e.toString(),
-                            e.isABSONObj());
-
-                    PlanStage* subNode = parseQuery(dbname, e.Obj(), workingSet, exprs);
-                    uassert(16974, "Can't parse sub-node of mergeSort: " + e.Obj().toString(),
-                            NULL != subNode);
-                    // takes ownership
-                    mergeStage->addChild(subNode);
-                }
-                return mergeStage.release();
-            }
-            else if ("text" == nodeName) {
-                string ns = nodeArgs["name"].String();
-                string search = nodeArgs["search"].String();
-                Database* db = cc().database();
-                Collection* collection = db->getCollection( ns );
-                uassert(17193, "Can't find namespace " + ns, collection);
-                vector<IndexDescriptor*> idxMatches;
-                collection->getIndexCatalog()->findIndexByType("text", idxMatches);
-                uassert(17194, "Expected exactly one text index", idxMatches.size() == 1);
-
-                IndexDescriptor* index = idxMatches[0];
-                FTSAccessMethod* fam =
-                    dynamic_cast<FTSAccessMethod*>( collection->getIndexCatalog()->getIndex( index ) );
-                TextStageParams params(fam->getSpec());
-                params.ns = ns;
-                params.index = index;
-
-                // TODO: Deal with non-empty filters.  This is a hack to put in covering information
-                // that can only be checked for equality.  We ignore this now.
-                Status s = fam->getSpec().getIndexPrefix(BSONObj(), &params.indexPrefix);
-                if (!s.isOK()) {
-                    // errmsg = s.toString();
-                    return NULL;
-                }
-
-                params.spec = fam->getSpec();
-
-                if (!params.query.parse(search,
-                                        fam->getSpec().defaultLanguage().str().c_str()).isOK()) {
-                    return NULL;
-                }
-
-                return new TextStage(params, workingSet, matcher);
-            }
-            else {
+                std::unique_ptr<MatchExpression> me = std::move(statusWithMatcher.getValue());
+                // exprs is what will wind up deleting this.
+                matcher = me.get();
+                verify(NULL != matcher);
+                exprs->push_back(std::move(me));
+            } else if (argsTag == e.fieldName()) {
+                nodeArgs = argObj;
+            } else {
+                uasserted(16910,
+                          "Unknown fieldname " + string(e.fieldName()) + " in query node " +
+                              obj.toString());
                 return NULL;
             }
         }
-    } stageDebugCmd;
+
+        string nodeName = firstElt.fieldName();
+
+        if ("ixscan" == nodeName) {
+            const IndexDescriptor* desc;
+            if (BSONElement keyPatternElement = nodeArgs["keyPattern"]) {
+                // This'll throw if it's not an obj but that's OK.
+                BSONObj keyPatternObj = keyPatternElement.Obj();
+                std::vector<const IndexDescriptor*> indexes;
+                collection->getIndexCatalog()->findIndexesByKeyPattern(
+                    opCtx, keyPatternObj, false, &indexes);
+                uassert(16890,
+                        str::stream() << "Can't find index: " << keyPatternObj,
+                        !indexes.empty());
+                uassert(ErrorCodes::AmbiguousIndexKeyPattern,
+                        str::stream() << indexes.size() << " matching indexes for key pattern: "
+                                      << keyPatternObj
+                                      << ". Conflicting indexes: "
+                                      << indexes[0]->infoObj()
+                                      << ", "
+                                      << indexes[1]->infoObj(),
+                        indexes.size() == 1);
+                desc = indexes[0];
+            } else {
+                uassert(40306,
+                        str::stream() << "Index 'name' must be a string in: " << nodeArgs,
+                        nodeArgs["name"].type() == BSONType::String);
+                StringData name = nodeArgs["name"].valueStringData();
+                desc = collection->getIndexCatalog()->findIndexByName(opCtx, name);
+                uassert(40223, str::stream() << "Can't find index: " << name.toString(), desc);
+            }
+
+            IndexScanParams params(opCtx, desc);
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = stripFieldNames(nodeArgs["startKey"].Obj());
+            params.bounds.endKey = stripFieldNames(nodeArgs["endKey"].Obj());
+            params.bounds.boundInclusion = IndexBounds::makeBoundInclusionFromBoundBools(
+                nodeArgs["startKeyInclusive"].Bool(), nodeArgs["endKeyInclusive"].Bool());
+            params.direction = nodeArgs["direction"].numberInt();
+            params.shouldDedup = desc->isMultikey(opCtx);
+
+            return new IndexScan(opCtx, params, workingSet, matcher);
+        } else if ("andHash" == nodeName) {
+            uassert(
+                16921, "Nodes argument must be provided to AND", nodeArgs["nodes"].isABSONObj());
+
+            auto andStage = make_unique<AndHashStage>(opCtx, workingSet);
+
+            int nodesAdded = 0;
+            BSONObjIterator it(nodeArgs["nodes"].Obj());
+            while (it.more()) {
+                BSONElement e = it.next();
+                uassert(16922, "node of AND isn't an obj?: " + e.toString(), e.isABSONObj());
+
+                PlanStage* subNode = parseQuery(opCtx, collection, e.Obj(), workingSet, exprs);
+                uassert(
+                    16923, "Can't parse sub-node of AND: " + e.Obj().toString(), NULL != subNode);
+                // takes ownership
+                andStage->addChild(subNode);
+                ++nodesAdded;
+            }
+
+            uassert(16927, "AND requires more than one child", nodesAdded >= 2);
+
+            return andStage.release();
+        } else if ("andSorted" == nodeName) {
+            uassert(
+                16924, "Nodes argument must be provided to AND", nodeArgs["nodes"].isABSONObj());
+
+            auto andStage = make_unique<AndSortedStage>(opCtx, workingSet);
+
+            int nodesAdded = 0;
+            BSONObjIterator it(nodeArgs["nodes"].Obj());
+            while (it.more()) {
+                BSONElement e = it.next();
+                uassert(16925, "node of AND isn't an obj?: " + e.toString(), e.isABSONObj());
+
+                PlanStage* subNode = parseQuery(opCtx, collection, e.Obj(), workingSet, exprs);
+                uassert(
+                    16926, "Can't parse sub-node of AND: " + e.Obj().toString(), NULL != subNode);
+                // takes ownership
+                andStage->addChild(subNode);
+                ++nodesAdded;
+            }
+
+            uassert(16928, "AND requires more than one child", nodesAdded >= 2);
+
+            return andStage.release();
+        } else if ("or" == nodeName) {
+            uassert(
+                16934, "Nodes argument must be provided to AND", nodeArgs["nodes"].isABSONObj());
+            uassert(16935, "Dedup argument must be provided to OR", !nodeArgs["dedup"].eoo());
+            BSONObjIterator it(nodeArgs["nodes"].Obj());
+            auto orStage =
+                make_unique<OrStage>(opCtx, workingSet, nodeArgs["dedup"].Bool(), matcher);
+            while (it.more()) {
+                BSONElement e = it.next();
+                if (!e.isABSONObj()) {
+                    return NULL;
+                }
+                PlanStage* subNode = parseQuery(opCtx, collection, e.Obj(), workingSet, exprs);
+                uassert(
+                    16936, "Can't parse sub-node of OR: " + e.Obj().toString(), NULL != subNode);
+                // takes ownership
+                orStage->addChild(subNode);
+            }
+
+            return orStage.release();
+        } else if ("fetch" == nodeName) {
+            uassert(
+                16929, "Node argument must be provided to fetch", nodeArgs["node"].isABSONObj());
+            PlanStage* subNode =
+                parseQuery(opCtx, collection, nodeArgs["node"].Obj(), workingSet, exprs);
+            uassert(28731,
+                    "Can't parse sub-node of FETCH: " + nodeArgs["node"].Obj().toString(),
+                    NULL != subNode);
+            return new FetchStage(opCtx, workingSet, subNode, matcher, collection);
+        } else if ("limit" == nodeName) {
+            uassert(
+                16937, "Limit stage doesn't have a filter (put it on the child)", NULL == matcher);
+            uassert(
+                16930, "Node argument must be provided to limit", nodeArgs["node"].isABSONObj());
+            uassert(16931, "Num argument must be provided to limit", nodeArgs["num"].isNumber());
+            PlanStage* subNode =
+                parseQuery(opCtx, collection, nodeArgs["node"].Obj(), workingSet, exprs);
+            uassert(28732,
+                    "Can't parse sub-node of LIMIT: " + nodeArgs["node"].Obj().toString(),
+                    NULL != subNode);
+            return new LimitStage(opCtx, nodeArgs["num"].numberInt(), workingSet, subNode);
+        } else if ("skip" == nodeName) {
+            uassert(
+                16938, "Skip stage doesn't have a filter (put it on the child)", NULL == matcher);
+            uassert(16932, "Node argument must be provided to skip", nodeArgs["node"].isABSONObj());
+            uassert(16933, "Num argument must be provided to skip", nodeArgs["num"].isNumber());
+            PlanStage* subNode =
+                parseQuery(opCtx, collection, nodeArgs["node"].Obj(), workingSet, exprs);
+            uassert(28733,
+                    "Can't parse sub-node of SKIP: " + nodeArgs["node"].Obj().toString(),
+                    NULL != subNode);
+            return new SkipStage(opCtx, nodeArgs["num"].numberInt(), workingSet, subNode);
+        } else if ("cscan" == nodeName) {
+            CollectionScanParams params;
+
+            // What direction?
+            uassert(16963,
+                    "Direction argument must be specified and be a number",
+                    nodeArgs["direction"].isNumber());
+            if (1 == nodeArgs["direction"].numberInt()) {
+                params.direction = CollectionScanParams::FORWARD;
+            } else {
+                params.direction = CollectionScanParams::BACKWARD;
+            }
+
+            return new CollectionScan(opCtx, collection, params, workingSet, matcher);
+        } else if ("mergeSort" == nodeName) {
+            uassert(
+                16971, "Nodes argument must be provided to sort", nodeArgs["nodes"].isABSONObj());
+            uassert(16972,
+                    "Pattern argument must be provided to sort",
+                    nodeArgs["pattern"].isABSONObj());
+
+            MergeSortStageParams params;
+            params.pattern = nodeArgs["pattern"].Obj();
+            // Dedup is true by default.
+
+            auto mergeStage = make_unique<MergeSortStage>(opCtx, params, workingSet);
+
+            BSONObjIterator it(nodeArgs["nodes"].Obj());
+            while (it.more()) {
+                BSONElement e = it.next();
+                uassert(16973, "node of mergeSort isn't an obj?: " + e.toString(), e.isABSONObj());
+
+                PlanStage* subNode = parseQuery(opCtx, collection, e.Obj(), workingSet, exprs);
+                uassert(16974,
+                        "Can't parse sub-node of mergeSort: " + e.Obj().toString(),
+                        NULL != subNode);
+                // takes ownership
+                mergeStage->addChild(subNode);
+            }
+            return mergeStage.release();
+        } else if ("text" == nodeName) {
+            string search = nodeArgs["search"].String();
+
+            vector<const IndexDescriptor*> idxMatches;
+            collection->getIndexCatalog()->findIndexByType(opCtx, "text", idxMatches);
+            uassert(17194, "Expected exactly one text index", idxMatches.size() == 1);
+
+            const IndexDescriptor* index = idxMatches[0];
+            const FTSAccessMethod* fam = dynamic_cast<const FTSAccessMethod*>(
+                collection->getIndexCatalog()->getEntry(index)->accessMethod());
+            invariant(fam);
+            TextStageParams params(fam->getSpec());
+            params.index = index;
+
+            // TODO: Deal with non-empty filters.  This is a hack to put in covering information
+            // that can only be checked for equality.  We ignore this now.
+            Status s = fam->getSpec().getIndexPrefix(BSONObj(), &params.indexPrefix);
+            if (!s.isOK()) {
+                return NULL;
+            }
+
+            params.spec = fam->getSpec();
+
+            params.query.setQuery(search);
+            params.query.setLanguage(fam->getSpec().defaultLanguage().str());
+            params.query.setCaseSensitive(TextMatchExpressionBase::kCaseSensitiveDefault);
+            params.query.setDiacriticSensitive(TextMatchExpressionBase::kDiacriticSensitiveDefault);
+            if (!params.query.parse(fam->getSpec().getTextIndexVersion()).isOK()) {
+                return NULL;
+            }
+
+            return new TextStage(opCtx, params, workingSet, matcher);
+        } else if ("delete" == nodeName) {
+            uassert(
+                18636, "Delete stage doesn't have a filter (put it on the child)", NULL == matcher);
+            uassert(
+                18637, "node argument must be provided to delete", nodeArgs["node"].isABSONObj());
+            uassert(18638,
+                    "isMulti argument must be provided to delete",
+                    nodeArgs["isMulti"].type() == Bool);
+            PlanStage* subNode =
+                parseQuery(opCtx, collection, nodeArgs["node"].Obj(), workingSet, exprs);
+            uassert(28734,
+                    "Can't parse sub-node of DELETE: " + nodeArgs["node"].Obj().toString(),
+                    NULL != subNode);
+            auto params = std::make_unique<DeleteStageParams>();
+            params->isMulti = nodeArgs["isMulti"].Bool();
+            return new DeleteStage(opCtx, std::move(params), workingSet, collection, subNode);
+        } else {
+            return NULL;
+        }
+    }
+};
+
+MONGO_REGISTER_TEST_COMMAND(StageDebugCmd);
 
 }  // namespace mongo

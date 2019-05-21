@@ -1,29 +1,27 @@
-load( "jstests/libs/fts.js" );
+// Cannot implicitly shard accessed collections because of extra shard key index in sharded
+// collection.
+// @tags: [assumes_no_implicit_index_creation]
+(function() {
+    "use strict";
 
-t = db.text1;
-t.drop();
+    load("jstests/libs/fts.js");
 
-// this test requires usePowerOf2Sizes to be off
-db.createCollection( t.getName(), {"usePowerOf2Sizes" : false } );
-assert.eq(0, t.stats().userFlags);
+    const coll = db.text1;
+    coll.drop();
 
-assert.eq( [] , queryIDS( t , "az" ) , "A0" );
+    assert.commandWorked(coll.createIndex({x: "text"}, {name: "x_text"}));
 
-t.save( { _id : 1 , x : "az b c" } );
-t.save( { _id : 2 , x : "az b" } );
-t.save( { _id : 3 , x : "b c" } );
-t.save( { _id : 4 , x : "b c d" } );
+    assert.eq([], queryIDS(coll, "az"), "A0");
 
-assert.eq(t.stats().userFlags, 0,
-          "A new collection should not have power-of-2 storage allocation strategy");
-t.ensureIndex( { x : "text" } );
-assert.eq(t.stats().userFlags, 1,
-          "Creating a text index on a collection should change the allocation strategy " +
-          "to power-of-2.");
+    assert.writeOK(coll.insert({_id: 1, x: "az b c"}));
+    assert.writeOK(coll.insert({_id: 2, x: "az b"}));
+    assert.writeOK(coll.insert({_id: 3, x: "b c"}));
+    assert.writeOK(coll.insert({_id: 4, x: "b c d"}));
 
-assert.eq( [1,2,3,4] , queryIDS( t , "c az" ) , "A1" );
-assert.eq( [4] , queryIDS( t , "d" ) , "A2" );
+    assert.eq([1, 2, 3, 4], queryIDS(coll, "c az").sort(), "A1");
+    assert.eq([4], queryIDS(coll, "d"), "A2");
 
-idx = db.system.indexes.findOne( { ns: t.getFullName(), "weights.x" : 1 } )
-assert( idx.v >= 1, tojson( idx ) )
-assert( idx.textIndexVersion >= 1, tojson( idx ) )
+    const index = coll.getIndexes().find(index => index.name === "x_text");
+    assert.neq(index, undefined);
+    assert.gte(index.textIndexVersion, 1, tojson(index));
+}());

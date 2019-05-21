@@ -1,47 +1,51 @@
+// Tests that nodes sync from each other properly and that nodes find new sync sources when they
+// are disconnected from their current sync source.
 
-var replTest = new ReplSetTest({ name: 'testSet', nodes: 5 });
-var nodes = replTest.startSet({ oplogSize: "2" });
-replTest.initiate();
+(function() {
+    'use strict';
 
-jsTestLog("Replica set test initialized, reconfiguring to give one node higher priority");
-var master = replTest.getMaster();
-var config = master.getDB("local").system.replset.findOne();
-config.version++;
-config.members[0].priority = 2;
+    var replTest = new ReplSetTest({
+        name: 'sync2',
+        nodes: [{rsConfig: {priority: 5}}, {arbiter: true}, {}, {}, {}],
+        useBridge: true
+    });
+    var conns = replTest.startSet();
+    replTest.initiate();
 
-try {
-    master.getDB("admin").runCommand({replSetReconfig : config});
-}
-catch(e) {
-    print(e);
-}
+    var master = replTest.getPrimary();
+    jsTestLog("Replica set test initialized");
 
-replTest.awaitSecondaryNodes();
-// initial sync
-master.getDB("foo").bar.insert({x:1});
-replTest.awaitReplication();
+    master.getDB("foo").bar.insert({x: 1});
+    replTest.awaitReplication();
 
-jsTestLog("Bridging replica set");
-master = replTest.bridge();
+    conns[0].disconnect(conns[4]);
+    conns[1].disconnect(conns[2]);
+    conns[2].disconnect(conns[3]);
+    conns[3].disconnect(conns[1]);
 
-replTest.partition(0,4);
-replTest.partition(1,2);
-replTest.partition(2,3);
-replTest.partition(3,1);
+    // 4 is connected to 2
+    conns[4].disconnect(conns[1]);
+    conns[4].disconnect(conns[3]);
 
-// 4 is connected to 2
-replTest.partition(4,1);
-replTest.partition(4,3);
+    assert.soon(function() {
+        master = replTest.getPrimary();
+        return master === conns[0];
+    }, "node 0 should become primary before timeout", replTest.kDefaultTimeoutMS);
 
-jsTestLog("Checking that ops still replicate correctly");
-var option = { writeConcern: { w: 5, wtimeout: 30000 }};
-assert.writeOK(master.getDB("foo").bar.insert({ x: 1 }, option));
+    replTest.awaitReplication();
+    jsTestLog("Checking that ops still replicate correctly");
+    var option = {writeConcern: {w: conns.length - 1, wtimeout: replTest.kDefaultTimeoutMS}};
+    // In PV0, this write can fail as a result of a bad spanning tree. If 2 was syncing from 4 prior
+    // to bridging, it will not change sync sources and receive the write in time. This was not a
+    // problem in 3.0 because the old version of mongobridge caused all the nodes to restart during
+    // partitioning, forcing the set to rebuild the spanning tree.
+    assert.writeOK(master.getDB("foo").bar.insert({x: 1}, option));
 
-// 4 is connected to 3
-replTest.partition(4,2);
-replTest.unPartition(4,3);
+    // 4 is connected to 3
+    conns[4].disconnect(conns[2]);
+    conns[4].reconnect(conns[3]);
 
-option = { writeConcern: { w: 5, wtimeout: 30000 }};
-assert.writeOK(master.getDB("foo").bar.insert({ x: 1 }, option));
+    assert.writeOK(master.getDB("foo").bar.insert({x: 1}, option));
 
-replTest.stopSet();
+    replTest.stopSet();
+}());

@@ -3,45 +3,45 @@
 //  1.) shard collection on hashed "a", ensure unique index {a:1, b:1}
 //  2.) reverse order
 
-var s = new ShardingTest( { name : jsTestName() , shards : 1 , mongos : 1, verbose : 1 } );
-var dbName = "test";
-var collName = "foo";
-var ns = dbName + "." + collName;
-var db = s.getDB( dbName );
-var coll = db.getCollection( collName );
+// This test triggers a compiler bug that causes a crash when compiling with optimizations on, see
+// SERVER-36321.
+// @tags: [blacklist_from_rhel_67_s390x]
+(function() {
+    'use strict';
 
-// Enable sharding on DB
-var res = db.adminCommand( { enablesharding : dbName } );
+    var s = new ShardingTest({shards: 1, mongos: 1});
+    var dbName = "test";
+    var collName = "foo";
+    var ns = dbName + "." + collName;
+    var db = s.getDB(dbName);
+    var coll = db.getCollection(collName);
 
-// for simplicity start by turning off balancer
-var res = s.stopBalancer();
+    // Enable sharding on DB
+    assert.commandWorked(db.adminCommand({enablesharding: dbName}));
 
-// shard a fresh collection using a hashed shard key
-coll.drop();
-assert.commandWorked(db.adminCommand( { shardcollection : ns , key : { a : "hashed" } } ));
-db.printShardingStatus();
+    // Shard a fresh collection using a hashed shard key
+    assert.commandWorked(db.adminCommand({shardcollection: ns, key: {a: "hashed"}}));
 
-// Create unique index
-coll.ensureIndex({a:1, b:1}, {unique:true})
-assert.gleSuccess(db, "unique index failed");
+    // Create unique index
+    assert.commandWorked(coll.ensureIndex({a: 1, b: 1}, {unique: true}));
 
-jsTest.log("------ indexes -------")
-jsTest.log(tojson(coll.getIndexes()));
+    jsTest.log("------ indexes -------");
+    jsTest.log(tojson(coll.getIndexes()));
 
-// Second Part
-jsTest.log("------ dropping sharded collection to start part 2 -------")
-coll.drop();
+    // Second Part
+    jsTest.log("------ dropping sharded collection to start part 2 -------");
+    coll.drop();
 
-//Create unique index
-coll.ensureIndex({a:1, b:1}, {unique:true})
-assert.gleSuccess(db, "unique index failed 2");
+    // Create unique index
+    assert.commandWorked(coll.ensureIndex({a: 1, b: 1}, {unique: true}));
 
-// shard a fresh collection using a hashed shard key
-assert.commandWorked(db.adminCommand( { shardcollection : ns , key : { a : "hashed" } } ),
-                     "shardcollection didn't worked 2");
+    // shard a fresh collection using a hashed shard key
+    assert.commandWorked(db.adminCommand({shardcollection: ns, key: {a: "hashed"}}),
+                         "shardcollection didn't worked 2");
 
-db.printShardingStatus();
-jsTest.log("------ indexes 2-------");
-jsTest.log(tojson(coll.getIndexes()));
+    s.printShardingStatus();
+    jsTest.log("------ indexes 2-------");
+    jsTest.log(tojson(coll.getIndexes()));
 
-s.stop()
+    s.stop();
+})();

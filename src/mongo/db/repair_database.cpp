@@ -1,458 +1,236 @@
-// repair_database.cpp
-
 /**
-*    Copyright (C) 2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
+
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
+#include "mongo/platform/basic.h"
+
+#include <algorithm>
 
 #include "mongo/db/repair_database.h"
 
-#include <boost/filesystem/operations.hpp>
-
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_validate.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/index_create.h"
-#include "mongo/db/client.h"
-#include "mongo/db/cloner.h"
+#include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/kill_current_op.h"
-#include "mongo/db/structure/collection_iterator.h"
-#include "mongo/util/file.h"
-#include "mongo/util/file_allocator.h"
+#include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-    typedef boost::filesystem::path Path;
+StatusWith<IndexNameObjs> getIndexNameObjs(OperationContext* opCtx,
+                                           CollectionCatalogEntry* cce,
+                                           stdx::function<bool(const std::string&)> filter) {
+    IndexNameObjs ret;
+    std::vector<std::string>& indexNames = ret.first;
+    std::vector<BSONObj>& indexSpecs = ret.second;
+    {
+        // Fetch all indexes
+        cce->getAllIndexes(opCtx, &indexNames);
+        auto newEnd =
+            std::remove_if(indexNames.begin(),
+                           indexNames.end(),
+                           [&filter](const std::string& indexName) { return !filter(indexName); });
+        indexNames.erase(newEnd, indexNames.end());
 
-    // TODO SERVER-4328
-    bool inDBRepair = false;
-    struct doingRepair {
-        doingRepair() {
-            verify( ! inDBRepair );
-            inDBRepair = true;
-        }
-        ~doingRepair() {
-            inDBRepair = false;
-        }
-    };
+        indexSpecs.reserve(indexNames.size());
 
-    // inheritable class to implement an operation that may be applied to all
-    // files in a database using _applyOpToDataFiles()
-    class FileOp {
-    public:
-        virtual ~FileOp() {}
-        // Return true if file exists and operation successful
-        virtual bool apply( const boost::filesystem::path &p ) = 0;
-        virtual const char * op() const = 0;
-    };
-
-    void _applyOpToDataFiles(const string& database, FileOp &fo, bool afterAllocator = false,
-                             const string& path = storageGlobalParams.dbpath);
-
-    void _deleteDataFiles(const std::string& database) {
-        if (storageGlobalParams.directoryperdb) {
-            FileAllocator::get()->waitUntilFinished();
-            MONGO_ASSERT_ON_EXCEPTION_WITH_MSG(
-                    boost::filesystem::remove_all(
-                        boost::filesystem::path(storageGlobalParams.dbpath) / database),
-                                                "delete data files with a directoryperdb");
-            return;
-        }
-        class : public FileOp {
-            virtual bool apply( const boost::filesystem::path &p ) {
-                return boost::filesystem::remove( p );
+        for (const auto& name : indexNames) {
+            BSONObj spec = cce->getIndexSpec(opCtx, name);
+            using IndexVersion = IndexDescriptor::IndexVersion;
+            IndexVersion indexVersion = IndexVersion::kV1;
+            if (auto indexVersionElem = spec[IndexDescriptor::kIndexVersionFieldName]) {
+                auto indexVersionNum = indexVersionElem.numberInt();
+                invariant(indexVersionNum == static_cast<int>(IndexVersion::kV1) ||
+                          indexVersionNum == static_cast<int>(IndexVersion::kV2));
+                indexVersion = static_cast<IndexVersion>(indexVersionNum);
             }
-            virtual const char * op() const {
-                return "remove";
-            }
-        } deleter;
-        _applyOpToDataFiles( database, deleter, true );
-    }
+            invariant(spec.isOwned());
+            indexSpecs.push_back(spec);
 
-    void boostRenameWrapper( const Path &from, const Path &to ) {
-        try {
-            boost::filesystem::rename( from, to );
-        }
-        catch ( const boost::filesystem::filesystem_error & ) {
-            // boost rename doesn't work across partitions
-            boost::filesystem::copy_file( from, to);
-            boost::filesystem::remove( from );
+            const BSONObj key = spec.getObjectField("key");
+            const Status keyStatus = index_key_validate::validateKeyPattern(key, indexVersion);
+            if (!keyStatus.isOK()) {
+                return Status(
+                    ErrorCodes::CannotCreateIndex,
+                    str::stream()
+                        << "Cannot rebuild index "
+                        << spec
+                        << ": "
+                        << keyStatus.reason()
+                        << " For more info see http://dochub.mongodb.org/core/index-validation");
+            }
         }
     }
 
-    // back up original database files to 'temp' dir
-    void _renameForBackup( const std::string& database, const Path &reservedPath ) {
-        Path newPath( reservedPath );
-        if (storageGlobalParams.directoryperdb)
-            newPath /= database;
-        class Renamer : public FileOp {
-        public:
-            Renamer( const Path &newPath ) : newPath_( newPath ) {}
-        private:
-            const boost::filesystem::path &newPath_;
-            virtual bool apply( const Path &p ) {
-                if ( !boost::filesystem::exists( p ) )
-                    return false;
-                boostRenameWrapper( p, newPath_ / ( p.leaf().string() + ".bak" ) );
-                return true;
-            }
-            virtual const char * op() const {
-                return "renaming";
-            }
-        } renamer( newPath );
-        _applyOpToDataFiles( database, renamer, true );
-    }
-
-    intmax_t dbSize( const string& database ) {
-        class SizeAccumulator : public FileOp {
-        public:
-            SizeAccumulator() : totalSize_( 0 ) {}
-            intmax_t size() const {
-                return totalSize_;
-            }
-        private:
-            virtual bool apply( const boost::filesystem::path &p ) {
-                if ( !boost::filesystem::exists( p ) )
-                    return false;
-                totalSize_ += boost::filesystem::file_size( p );
-                return true;
-            }
-            virtual const char *op() const {
-                return "checking size";
-            }
-            intmax_t totalSize_;
-        };
-        SizeAccumulator sa;
-        _applyOpToDataFiles( database, sa );
-        return sa.size();
-    }
-
-    // move temp files to standard data dir
-    void _replaceWithRecovered( const string& database, const char *reservedPathString ) {
-        Path newPath(storageGlobalParams.dbpath);
-        if (storageGlobalParams.directoryperdb)
-            newPath /= database;
-        class Replacer : public FileOp {
-        public:
-            Replacer( const Path &newPath ) : newPath_( newPath ) {}
-        private:
-            const boost::filesystem::path &newPath_;
-            virtual bool apply( const Path &p ) {
-                if ( !boost::filesystem::exists( p ) )
-                    return false;
-                boostRenameWrapper( p, newPath_ / p.leaf() );
-                return true;
-            }
-            virtual const char * op() const {
-                return "renaming";
-            }
-        } replacer( newPath );
-        _applyOpToDataFiles( database, replacer, true, reservedPathString );
-    }
-
-    // generate a directory name for storing temp data files
-    Path uniqueReservedPath( const char *prefix ) {
-        Path repairPath = Path(storageGlobalParams.repairpath);
-        Path reservedPath;
-        int i = 0;
-        bool exists = false;
-        do {
-            stringstream ss;
-            ss << prefix << "_repairDatabase_" << i++;
-            reservedPath = repairPath / ss.str();
-            MONGO_ASSERT_ON_EXCEPTION( exists = boost::filesystem::exists( reservedPath ) );
-        }
-        while ( exists );
-        return reservedPath;
-    }
-
-    void _applyOpToDataFiles( const string& database, FileOp &fo, bool afterAllocator, const string& path ) {
-        if ( afterAllocator )
-            FileAllocator::get()->waitUntilFinished();
-        string c = database;
-        c += '.';
-        boost::filesystem::path p(path);
-        if (storageGlobalParams.directoryperdb)
-            p /= database;
-        boost::filesystem::path q;
-        q = p / (c+"ns");
-        bool ok = false;
-        MONGO_ASSERT_ON_EXCEPTION( ok = fo.apply( q ) );
-        if ( ok ) {
-            LOG(2) << fo.op() << " file " << q.string() << endl;
-        }
-        int i = 0;
-        int extra = 10; // should not be necessary, this is defensive in case there are missing files
-        while ( 1 ) {
-            verify( i <= DiskLoc::MaxFiles );
-            stringstream ss;
-            ss << c << i;
-            q = p / ss.str();
-            MONGO_ASSERT_ON_EXCEPTION( ok = fo.apply(q) );
-            if ( ok ) {
-                if ( extra != 10 ) {
-                    LOG(1) << fo.op() << " file " << q.string() << endl;
-                    log() << "  _applyOpToDataFiles() warning: extra == " << extra << endl;
-                }
-            }
-            else if ( --extra <= 0 )
-                break;
-            i++;
-        }
-    }
-
-    class RepairFileDeleter {
-    public:
-        RepairFileDeleter( const string& dbName,
-                           const string& pathString,
-                           const Path& path )
-            : _dbName( dbName ),
-              _pathString( pathString ),
-              _path( path ),
-              _success( false ) {
-        }
-
-        ~RepairFileDeleter() {
-            if ( _success )
-                 return;
-
-            log() << "cleaning up failed repair "
-                  << "db: " << _dbName << " path: " << _pathString;
-
-            try {
-                getDur().syncDataAndTruncateJournal();
-                MongoFile::flushAll(true); // need both in case journaling is disabled
-                {
-                    Client::Context tempContext( _dbName, _pathString );
-                    Database::closeDatabase( _dbName, _pathString );
-                }
-                MONGO_ASSERT_ON_EXCEPTION( boost::filesystem::remove_all( _path ) );
-            }
-            catch ( DBException& e ) {
-                error() << "RepairFileDeleter failed to cleanup: " << e;
-                error() << "aborting";
-                fassertFailed( 17402 );
-            }
-        }
-
-        void success() {
-            _success = true;
-        }
-
-    private:
-        string _dbName;
-        string _pathString;
-        Path _path;
-        bool _success;
-    };
-
-    Status repairDatabase( string dbName,
-                           bool preserveClonedFilesOnFailure,
-                           bool backupOriginalFiles ) {
-        scoped_ptr<RepairFileDeleter> repairFileDeleter;
-        doingRepair dr;
-        dbName = nsToDatabase( dbName );
-
-        log() << "repairDatabase " << dbName << endl;
-
-        invariant( cc().database()->name() == dbName );
-        invariant( cc().database()->path() == storageGlobalParams.dbpath );
-
-        BackgroundOperation::assertNoBgOpInProgForDb(dbName);
-
-        getDur().syncDataAndTruncateJournal(); // Must be done before and after repair
-
-        intmax_t totalSize = dbSize( dbName );
-        intmax_t freeSize = File::freeSpace(storageGlobalParams.repairpath);
-
-        if ( freeSize > -1 && freeSize < totalSize ) {
-            return Status( ErrorCodes::OutOfDiskSpace,
-                           str::stream() << "Cannot repair database " << dbName
-                           << " having size: " << totalSize
-                           << " (bytes) because free disk space is: " << freeSize << " (bytes)" );
-        }
-
-        killCurrentOp.checkForInterrupt();
-
-        Path reservedPath =
-            uniqueReservedPath( ( preserveClonedFilesOnFailure || backupOriginalFiles ) ?
-                                "backup" : "_tmp" );
-        MONGO_ASSERT_ON_EXCEPTION( boost::filesystem::create_directory( reservedPath ) );
-        string reservedPathString = reservedPath.string();
-
-        if ( !preserveClonedFilesOnFailure )
-            repairFileDeleter.reset( new RepairFileDeleter( dbName,
-                                                            reservedPathString,
-                                                            reservedPath ) );
-
-        {
-            Database* originalDatabase = dbHolder().get( dbName, storageGlobalParams.dbpath );
-            if ( originalDatabase == NULL )
-                return Status( ErrorCodes::NamespaceNotFound, "database does not exist to repair" );
-
-            Database* tempDatabase = NULL;
-            {
-                bool justCreated = false;
-                tempDatabase = dbHolderW().getOrCreate( dbName, reservedPathString, justCreated );
-                invariant( justCreated );
-            }
-
-            map<string,CollectionOptions> namespacesToCopy;
-            {
-                string ns = dbName + ".system.namespaces";
-                Client::Context ctx( ns );
-                Collection* coll = originalDatabase->getCollection( ns );
-                if ( coll ) {
-                    scoped_ptr<CollectionIterator> it( coll->getIterator( DiskLoc(),
-                                                                          false,
-                                                                          CollectionScanParams::FORWARD ) );
-                    while ( !it->isEOF() ) {
-                        DiskLoc loc = it->getNext();
-                        BSONObj obj = coll->docFor( loc );
-
-                        string ns = obj["name"].String();
-
-                        NamespaceString nss( ns );
-                        if ( nss.isSystem() ) {
-                            if ( nss.isSystemDotIndexes() )
-                                continue;
-                            if ( nss.coll() == "system.namespaces" )
-                                continue;
-                        }
-
-                        if ( !nss.isNormal() )
-                            continue;
-
-                        CollectionOptions options;
-                        if ( obj["options"].isABSONObj() ) {
-                            Status status = options.parse( obj["options"].Obj() );
-                            if ( !status.isOK() )
-                                return status;
-                        }
-                        namespacesToCopy[ns] = options;
-                    }
-                }
-            }
-
-            for ( map<string,CollectionOptions>::const_iterator i = namespacesToCopy.begin();
-                  i != namespacesToCopy.end();
-                  ++i ) {
-                string ns = i->first;
-                CollectionOptions options = i->second;
-
-                Collection* tempCollection = NULL;
-                {
-                    Client::Context tempContext( ns, tempDatabase );
-                    tempCollection = tempDatabase->createCollection( ns, options, true, false );
-                }
-
-                Client::Context readContext( ns, originalDatabase );
-                Collection* originalCollection = originalDatabase->getCollection( ns );
-                invariant( originalCollection );
-
-                // data
-
-                MultiIndexBlock indexBlock( tempCollection );
-                {
-                    vector<BSONObj> indexes;
-                    IndexCatalog::IndexIterator ii =
-                        originalCollection->getIndexCatalog()->getIndexIterator( false );
-                    while ( ii.more() ) {
-                        IndexDescriptor* desc = ii.next();
-                        indexes.push_back( desc->infoObj() );
-                    }
-
-                    Client::Context tempContext( ns, tempDatabase );
-                    Status status = indexBlock.init( indexes );
-                    if ( !status.isOK() )
-                        return status;
-
-                }
-
-                scoped_ptr<CollectionIterator> iterator( originalCollection->getIterator( DiskLoc(),
-                                                                                          false,
-                                                                                          CollectionScanParams::FORWARD ) );
-                while ( !iterator->isEOF() ) {
-                    DiskLoc loc = iterator->getNext();
-                    invariant( !loc.isNull() );
-
-                    BSONObj doc = originalCollection->docFor( loc );
-
-                    Client::Context tempContext( ns, tempDatabase );
-                    StatusWith<DiskLoc> result = tempCollection->insertDocument( doc, indexBlock );
-                    if ( !result.isOK() )
-                        return result.getStatus();
-
-                    getDur().commitIfNeeded();
-                    killCurrentOp.checkForInterrupt(false);
-                }
-
-                {
-                    Client::Context tempContext( ns, tempDatabase );
-                    Status status = indexBlock.commit();
-                    if ( !status.isOK() )
-                        return status;
-                }
-
-            }
-
-            getDur().syncDataAndTruncateJournal();
-            MongoFile::flushAll(true); // need both in case journaling is disabled
-
-            killCurrentOp.checkForInterrupt(false);
-
-            Client::Context tempContext( dbName, reservedPathString );
-            Database::closeDatabase( dbName, reservedPathString );
-        }
-
-        Client::Context ctx( dbName );
-        Database::closeDatabase(dbName, storageGlobalParams.dbpath);
-
-
-        if ( backupOriginalFiles ) {
-            _renameForBackup( dbName, reservedPath );
-        }
-        else {
-            _deleteDataFiles( dbName );
-            MONGO_ASSERT_ON_EXCEPTION(
-                    boost::filesystem::create_directory(Path(storageGlobalParams.dbpath) / dbName));
-        }
-
-        if ( repairFileDeleter.get() )
-            repairFileDeleter->success();
-
-        _replaceWithRecovered( dbName, reservedPathString.c_str() );
-
-        if ( !backupOriginalFiles )
-            MONGO_ASSERT_ON_EXCEPTION( boost::filesystem::remove_all( reservedPath ) );
-
-        return Status::OK();
-    }
-
-
+    return ret;
 }
+
+Status rebuildIndexesOnCollection(OperationContext* opCtx,
+                                  CollectionCatalogEntry* cce,
+                                  const std::vector<BSONObj>& indexSpecs) {
+    // Skip the rest if there are no indexes to rebuild.
+    if (indexSpecs.empty())
+        return Status::OK();
+
+    // Rebuild the indexes provided by 'indexSpecs'.
+    IndexBuildsCoordinator* indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
+    UUID buildUUID = UUID::gen();
+    auto swRebuild =
+        indexBuildsCoord->startIndexRebuildForRecovery(opCtx, cce, indexSpecs, buildUUID);
+    if (!swRebuild.isOK()) {
+        return swRebuild.getStatus();
+    }
+
+    auto[numRecords, dataSize] = swRebuild.getValue();
+
+    auto rs = cce->getRecordStore();
+
+    // Update the record store stats after finishing and committing the index builds.
+    WriteUnitOfWork wuow(opCtx);
+    rs->updateStatsAfterRepair(opCtx, numRecords, dataSize);
+    wuow.commit();
+
+    return Status::OK();
+}
+
+namespace {
+Status repairCollections(OperationContext* opCtx,
+                         StorageEngine* engine,
+                         const std::string& dbName,
+                         stdx::function<void(const std::string& dbName)> onRecordStoreRepair) {
+
+    auto colls = CollectionCatalog::get(opCtx).getAllCollectionNamesFromDb(opCtx, dbName);
+
+    for (const auto& nss : colls) {
+        opCtx->checkForInterrupt();
+
+        log() << "Repairing collection " << nss;
+
+        Status status = engine->repairRecordStore(opCtx, nss);
+        if (!status.isOK())
+            return status;
+    }
+
+    onRecordStoreRepair(dbName);
+
+    for (const auto& nss : colls) {
+        opCtx->checkForInterrupt();
+
+        CollectionCatalogEntry* cce =
+            CollectionCatalog::get(opCtx).lookupCollectionCatalogEntryByNamespace(nss);
+        auto swIndexNameObjs = getIndexNameObjs(opCtx, cce);
+        if (!swIndexNameObjs.isOK())
+            return swIndexNameObjs.getStatus();
+
+        std::vector<BSONObj> indexSpecs = swIndexNameObjs.getValue().second;
+        Status status = rebuildIndexesOnCollection(opCtx, cce, indexSpecs);
+        if (!status.isOK())
+            return status;
+
+        engine->flushAllFiles(opCtx, true);
+    }
+    return Status::OK();
+}
+}  // namespace
+
+Status repairDatabase(OperationContext* opCtx,
+                      StorageEngine* engine,
+                      const std::string& dbName,
+                      stdx::function<void(const std::string& dbName)> onRecordStoreRepair) {
+    DisableDocumentValidation validationDisabler(opCtx);
+
+    // We must hold some form of lock here
+    invariant(opCtx->lockState()->isW());
+    invariant(dbName.find('.') == std::string::npos);
+
+    log() << "repairDatabase " << dbName;
+
+    BackgroundOperation::assertNoBgOpInProgForDb(dbName);
+
+    opCtx->checkForInterrupt();
+
+    // Close the db and invalidate all current users and caches.
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    databaseHolder->close(opCtx, dbName);
+
+    auto status = repairCollections(opCtx, engine, dbName, onRecordStoreRepair);
+    if (!status.isOK()) {
+        severe() << "Failed to repair database " << dbName << ": " << status.reason();
+    }
+
+    try {
+        // Ensure that we don't trigger an exception when attempting to take locks.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
+        // Open the db after everything finishes.
+        auto db = databaseHolder->openDb(opCtx, dbName);
+
+        // Set the minimum snapshot for all Collections in this db. This ensures that readers
+        // using majority readConcern level can only use the collections after their repaired
+        // versions are in the committed view.
+        auto clusterTime = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
+
+        for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
+            auto collection = *collIt;
+            if (collection) {
+                collection->setMinimumVisibleSnapshot(clusterTime);
+            }
+        }
+
+        // Restore oplog Collection pointer cache.
+        repl::acquireOplogCollectionForLogging(opCtx);
+    } catch (const ExceptionFor<ErrorCodes::MustDowngrade>&) {
+        // openDb can throw an exception with a MustDowngrade status if a collection does not
+        // have a UUID.
+        throw;
+    } catch (...) {
+        severe() << "Unexpected exception encountered while reopening database after repair.";
+        std::terminate();  // Logs additional info about the specific error.
+    }
+
+    return status;
+}
+
+}  // namespace mongo

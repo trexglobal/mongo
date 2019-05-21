@@ -1,6 +1,6 @@
 #!/usr/bin/make -f
 # -*- makefile -*-
-TOOLS=bsondump mongodump mongoexport mongofiles mongoimport mongooplog mongoperf mongorestore mongostat mongotop
+TOOLS=bsondump mongodump mongoexport mongofiles mongoimport mongorestore mongostat mongotop
 
 # Uncomment this to turn on verbose mode.
 export DH_VERBOSE=1
@@ -21,7 +21,6 @@ build-stamp: configure-stamp
 	# THE FOLLOWING LINE IS INTENTIONALLY COMMENTED. 
 	# scons 
 	#docbook-to-man debian/mongodb.sgml > mongodb.1
-
 	echo -n > debian/mongodb-org-tools.manpages
 	for binary in ${TOOLS} ; \
 	do \
@@ -58,6 +57,7 @@ clean:
 	rm -f mongorestore
 	rm -f mongodump
 	rm -f mongofiles
+	rm -f install_compass
 	rm -f .sconsign.dblite
 	rm -f libmongoclient.a
 	rm -rf client/*.o
@@ -81,14 +81,14 @@ install: build
 	mkdir -p $(CURDIR)/debian/mongodb-org-server/usr/bin
 	mkdir -p $(CURDIR)/debian/mongodb-org-mongos/usr/bin
 	mkdir -p $(CURDIR)/debian/mongodb-org-tools/usr/bin
-
-	cp -v $(CURDIR)/BINARIES/usr/bin/mongo $(CURDIR)/debian/mongodb-org-shell/usr/bin
-	cp -v $(CURDIR)/BINARIES/usr/bin/mongod $(CURDIR)/debian/mongodb-org-server/usr/bin
-	cp -v $(CURDIR)/BINARIES/usr/bin/mongos $(CURDIR)/debian/mongodb-org-mongos/usr/bin
+	cp -v $(CURDIR)/bin/mongo $(CURDIR)/debian/mongodb-org-shell/usr/bin
+	cp -v $(CURDIR)/bin/mongod $(CURDIR)/debian/mongodb-org-server/usr/bin
+	cp -v $(CURDIR)/bin/mongos $(CURDIR)/debian/mongodb-org-mongos/usr/bin
+	cp -v $(CURDIR)/bin/install_compass $(CURDIR)/debian/mongodb-org-tools/usr/bin
 
 	for binary in ${TOOLS} ; \
 	do \
-	  cp -v $(CURDIR)/BINARIES/usr/bin/$$binary $(CURDIR)/debian/mongodb-org-tools/usr/bin ; \
+	  cp -v $(CURDIR)/bin/$$binary $(CURDIR)/debian/mongodb-org-tools/usr/bin ; \
 	done
 
 	mkdir -p $(CURDIR)/debian/mongodb-org-server/etc

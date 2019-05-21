@@ -1,206 +1,230 @@
-s = new ShardingTest( { shards : 2, 
-                        verbose : 1,
-                        mongos : 1,
-                        other: { rs: true, 
-                                 numReplicas: 2, 
-                                 chunksize : 1,
-                                 rsOptions: { oplogSize : 50 } } } 
-                       );
+/**
+ * This test is labeled resource intensive because its total io_write is 625MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger.
+ * @tags: [resource_intensive]
+ */
+(function() {
+    'use strict';
 
-// reduce chunk size to split
-var config = s.getDB("config");
-config.settings.save({_id: "chunksize", value: 1});
-
-s.adminCommand( { enablesharding : "test" } )
-s.adminCommand( { shardcollection : "test.foo", key : { "_id" : 1 } } )
-
-jsTest.log( "Inserting a lot of documents into test.foo" )
-
-db = s.getDB( "test" );
-
-var idInc = 0;
-var valInc = 0;
-var str=""
-
-if (db.serverBuildInfo().bits == 32) {
-    // Make data ~0.5MB for 32 bit builds
-    for (var i = 0; i < 512; i++) str += "a";
-}
-else {
-    // Make data ~4MB
-    for (var i = 0; i < 4*1024; i++) str += "a";
-}
-
-for (j=0; j<100; j++) for (i=0; i<512; i++){ db.foo.save({ i : idInc++, val: valInc++, y:str})}
-
-jsTest.log( "Documents inserted, waiting for error..." )
-
-db.getLastError();
-
-jsTest.log( "Doing double-checks of insert..." )
-
-// Collect some useful stats to figure out what happened
-if( db.foo.find().itcount() != 51200 ){
-    sleep( 1000 )
-    
-    s.printShardingStatus(true);
-    
-    print( "Shard 0: " + s.shard0.getCollection( db.foo + "" ).find().itcount() )
-    print( "Shard 1: " + s.shard1.getCollection( db.foo + "" ).find().itcount() )
-    
-    for( var i = 0; i < 51200; i++ ){
-        if( ! db.foo.findOne({ i : i }, { i : 1 }) ){
-            print( "Could not find: " + i )
+    let s = new ShardingTest({
+        shards: 2,
+        mongos: 1,
+        other: {
+            rs: true,
+            numReplicas: 2,
+            chunkSize: 1,
+            rsOptions: {oplogSize: 50},
+            enableAutoSplit: true,
         }
-        if( i % 100 == 0 ) print( "Checked " + i )
+    });
+
+    assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
+    s.ensurePrimaryShard('test', s.shard0.shardName);
+    assert.commandWorked(s.s0.adminCommand({shardcollection: "test.foo", key: {"_id": 1}}));
+
+    let testDb = s.getDB("test");
+
+    jsTest.log("Inserting a lot of documents into test.foo");
+
+    // Make each document data to be 5K so that the total size is ~250MB
+    const str = "#".repeat(5 * 1024);
+
+    var idInc = 0;
+    var valInc = 0;
+
+    var bulk = testDb.foo.initializeUnorderedBulkOp();
+    for (var j = 0; j < 100; j++) {
+        for (var i = 0; i < 512; i++) {
+            bulk.insert({i: idInc++, val: valInc++, y: str});
+        }
     }
-    
-    print( "PROBABLY WILL ASSERT NOW" )
-}
+    assert.writeOK(bulk.execute({w: 2, wtimeout: 10 * 60 * 1000}));
 
-assert.soon( function(){ var c = db.foo.find().itcount(); print( "Count is " + c ); return c == 51200 } )
-//assert.eq( 51200, db.foo.find().itcount(), "Not all data was saved!" )
+    jsTest.log("Documents inserted, doing double-checks of insert...");
 
-s.printChunks();
-s.printChangeLog();
+    // Collect some useful stats to figure out what happened
+    if (testDb.foo.find().itcount() != 51200) {
+        s.printShardingStatus(true);
 
-function map() { emit('count', 1); } 
-function reduce(key, values) { return Array.sum(values) } 
+        print("Shard 0: " + s.shard0.getCollection(testDb.foo + "").find().itcount());
+        print("Shard 1: " + s.shard1.getCollection(testDb.foo + "").find().itcount());
 
-jsTest.log( "Test basic mapreduce..." )
+        for (var i = 0; i < 51200; i++) {
+            if (!testDb.foo.findOne({i: i}, {i: 1})) {
+                print("Could not find: " + i);
+            }
 
-// Test basic mapReduce
-for ( iter=0; iter<5; iter++ ){
+            if (i % 100 == 0)
+                print("Checked " + i);
+        }
 
-    print( "Test #" + iter )
-    
-    out = db.foo.mapReduce(map, reduce,"big_out") 
-}
+        assert(false, 'Incorect number of chunks found!');
+    }
 
-print( "Testing output to different db..." )
+    s.printChunks(testDb.foo.getFullName());
+    s.printChangeLog();
 
-// test output to a different DB
-// do it multiple times so that primary shard changes
-for (iter = 0; iter < 5; iter++) {
-    
-    print( "Test #" + iter )
-    
-    assert.eq( 51200, db.foo.find().itcount(), "Not all data was found!" )
-    
-    outCollStr = "mr_replace_col_" + iter;
-    outDbStr = "mr_db_" + iter;
+    function map() {
+        emit('count', 1);
+    }
+    function reduce(key, values) {
+        return Array.sum(values);
+    }
 
-    print("Testing mr replace into DB " + iter)
+    // Let chunks move around while map reduce is running
+    s.startBalancer();
 
-    res = db.foo.mapReduce( map , reduce , { out : { replace: outCollStr, db: outDbStr } } )
-    printjson(res);
+    jsTest.log("Test basic mapreduce...");
 
-    outDb = s.getDB(outDbStr);
-    outColl = outDb[outCollStr];
+    // Test basic mapReduce
+    for (var iter = 0; iter < 5; iter++) {
+        print("Test #" + iter);
+        testDb.foo.mapReduce(map, reduce, "big_out");
+    }
 
-    obj = outColl.convertToSingleObject("value");
-    
-    assert.eq( 51200 , obj.count , "Received wrong result " + obj.count );
+    print("Testing output to different db...");
 
-    print("checking result field");
-    assert.eq(res.result.collection, outCollStr, "Wrong collection " + res.result.collection);
-    assert.eq(res.result.db, outDbStr, "Wrong db " + res.result.db);
-}
+    // Test output to a different DB - do it multiple times so that the merging shard changes
+    for (var iter = 0; iter < 5; iter++) {
+        print("Test #" + iter);
 
-jsTest.log( "Verifying nonatomic M/R throws..." )
+        assert.eq(51200, testDb.foo.find().itcount(), "Not all data was found!");
 
-// check nonAtomic output
-assert.throws(function() { db.foo.mapReduce(map, reduce,{out: {replace: "big_out", nonAtomic: true}})});
+        let outCollStr = "mr_replace_col_" + iter;
+        let outDbStr = "mr_db_" + iter;
 
-jsTest.log( )
+        print("Testing mr replace into DB " + iter);
 
-// add docs with dup "i"
-valInc = 0;
-for (j=0; j<100; j++){ 
-    print( "Inserted document: " + (j * 100) );
-    for (i=0; i<512; i++){ db.foo.save({ i : idInc++, val: valInc++, y:str}) }
-    // wait for replication to catch up
-    db.runCommand({getLastError:1, w:2, wtimeout:10000});
-}
+        var res = testDb.foo.mapReduce(map, reduce, {out: {replace: outCollStr, db: outDbStr}});
+        printjson(res);
 
-jsTest.log( "Waiting for errors..." )
+        var outDb = s.getDB(outDbStr);
+        var outColl = outDb[outCollStr];
 
-assert.eq( null, db.getLastError() )
+        var obj = outColl.convertToSingleObject("value");
+        assert.eq(51200, obj.count, "Received wrong result " + obj.count);
 
-jsTest.log( "No errors..." )
+        print("Checking result field");
+        assert.eq(res.result.collection, outCollStr, "Wrong collection " + res.result.collection);
+        assert.eq(res.result.db, outDbStr, "Wrong db " + res.result.db);
+    }
 
+    jsTest.log("Verifying nonatomic M/R throws...");
 
-map2 = function() { emit(this.val, 1); }
-reduce2 = function(key, values) { return Array.sum(values); }
+    // Check nonAtomic output
+    assert.throws(function() {
+        testDb.foo.mapReduce(map, reduce, {out: {replace: "big_out", nonAtomic: true}});
+    });
 
-// test merge
-outcol = "big_out_merge";
+    jsTest.log("Adding documents");
 
-jsTestLog( "Test A" )
+    // Add docs with dup "i"
+    valInc = 0;
+    for (var j = 0; j < 100; j++) {
+        print("Inserted document: " + (j * 100));
+        var bulk = testDb.foo.initializeUnorderedBulkOp();
+        for (i = 0; i < 512; i++) {
+            bulk.insert({i: idInc++, val: valInc++, y: str});
+        }
+        assert.writeOK(bulk.execute({w: 2, wtimeout: 10 * 60 * 1000}));
+    }
 
-// mr quarter of the docs
-out = db.foo.mapReduce(map2, reduce2,{ query: {i : {$lt: 25600}}, out: {merge: outcol}});
-printjson(out);
-assert.eq( 25600 , out.counts.emit , "Received wrong result" );
-assert.eq( 25600 , out.counts.output , "Received wrong result" );
+    jsTest.log("No errors...");
 
-jsTestLog( "Test B" )
+    function map2() {
+        emit(this.val, 1);
+    }
+    function reduce2(key, values) {
+        return Array.sum(values);
+    }
 
-// mr further docs
-out = db.foo.mapReduce(map2, reduce2,{ query: {i : {$gte: 25600, $lt: 51200}}, out: {merge: outcol}});
-printjson(out);
-assert.eq( 25600 , out.counts.emit , "Received wrong result" );
-assert.eq( 51200 , out.counts.output , "Received wrong result" );
+    // Test merge
+    let outColMerge = 'big_out_merge';
 
-jsTestLog( "Test C" )
+    // M/R quarter of the docs
+    {
+        jsTestLog("Test A");
+        var out = testDb.foo.mapReduce(
+            map2, reduce2, {query: {i: {$lt: 25600}}, out: {merge: outColMerge}});
+        printjson(out);
+        assert.eq(25600, out.counts.emit, "Received wrong result");
+        assert.eq(25600, out.counts.output, "Received wrong result");
+    }
 
-// do 2nd half of docs
-out = db.foo.mapReduce(map2, reduce2,{ query: {i : {$gte: 51200}}, out: {merge: outcol, nonAtomic: true}});
-printjson(out);
-assert.eq( 51200 , out.counts.emit , "Received wrong result" );
-assert.eq( 51200 , out.counts.output , "Received wrong result" );
-assert.eq( 1 , db[outcol].findOne().value , "Received wrong result" );
+    // M/R further docs
+    {
+        jsTestLog("Test B");
+        var out = testDb.foo.mapReduce(
+            map2, reduce2, {query: {i: {$gte: 25600, $lt: 51200}}, out: {merge: outColMerge}});
+        printjson(out);
+        assert.eq(25600, out.counts.emit, "Received wrong result");
+        assert.eq(51200, out.counts.output, "Received wrong result");
+    }
 
-jsTestLog( "Test D" )
+    // M/R do 2nd half of docs
+    {
+        jsTestLog("Test C");
+        var out = testDb.foo.mapReduce(
+            map2, reduce2, {query: {i: {$gte: 51200}}, out: {merge: outColMerge, nonAtomic: true}});
+        printjson(out);
+        assert.eq(51200, out.counts.emit, "Received wrong result");
+        assert.eq(51200, out.counts.output, "Received wrong result");
+        assert.eq(1, testDb[outColMerge].findOne().value, "Received wrong result");
+    }
 
-// test reduce
-outcol = "big_out_reduce";
+    // Test reduce
+    let outColReduce = "big_out_reduce";
 
-// mr quarter of the docs
-out = db.foo.mapReduce(map2, reduce2,{ query: {i : {$lt: 25600}}, out: {reduce: outcol}});
-printjson(out);
-assert.eq( 25600 , out.counts.emit , "Received wrong result" );
-assert.eq( 25600 , out.counts.output , "Received wrong result" );
+    // M/R quarter of the docs
+    {
+        jsTestLog("Test D");
+        var out = testDb.foo.mapReduce(
+            map2, reduce2, {query: {i: {$lt: 25600}}, out: {reduce: outColReduce}});
+        printjson(out);
+        assert.eq(25600, out.counts.emit, "Received wrong result");
+        assert.eq(25600, out.counts.output, "Received wrong result");
+    }
 
-jsTestLog( "Test E" )
+    // M/R further docs
+    {
+        jsTestLog("Test E");
+        var out = testDb.foo.mapReduce(
+            map2, reduce2, {query: {i: {$gte: 25600, $lt: 51200}}, out: {reduce: outColReduce}});
+        printjson(out);
+        assert.eq(25600, out.counts.emit, "Received wrong result");
+        assert.eq(51200, out.counts.output, "Received wrong result");
+    }
 
-// mr further docs
-out = db.foo.mapReduce(map2, reduce2,{ query: {i : {$gte: 25600, $lt: 51200}}, out: {reduce: outcol}});
-printjson(out);
-assert.eq( 25600 , out.counts.emit , "Received wrong result" );
-assert.eq( 51200 , out.counts.output , "Received wrong result" );
+    // M/R do 2nd half of docs
+    {
+        jsTestLog("Test F");
+        var out = testDb.foo.mapReduce(
+            map2,
+            reduce2,
+            {query: {i: {$gte: 51200}}, out: {reduce: outColReduce, nonAtomic: true}});
+        printjson(out);
+        assert.eq(51200, out.counts.emit, "Received wrong result");
+        assert.eq(51200, out.counts.output, "Received wrong result");
+        assert.eq(2, testDb[outColReduce].findOne().value, "Received wrong result");
+    }
 
-jsTestLog( "Test F" )
+    // Verify that data is also on secondary
+    {
+        jsTestLog("Test G");
+        var primary = s.rs0._master;
+        var secondaries = s.rs0._slaves;
 
-// do 2nd half of docs
-out = db.foo.mapReduce(map2, reduce2,{ query: {i : {$gte: 51200}}, out: {reduce: outcol, nonAtomic: true}});
-printjson(out);
-assert.eq( 51200 , out.counts.emit , "Received wrong result" );
-assert.eq( 51200 , out.counts.output , "Received wrong result" );
-assert.eq( 2 , db[outcol].findOne().value , "Received wrong result" );
+        // Stop the balancer to prevent new writes from happening and make sure that replication can
+        // keep up even on slow machines
+        s.stopBalancer();
+        s.rs0.awaitReplication();
+        assert.eq(51200, primary.getDB("test")[outColReduce].find().itcount(), "Wrong count");
 
-jsTestLog( "Test G" )
+        for (var i = 0; i < secondaries.length; ++i) {
+            assert.eq(
+                51200, secondaries[i].getDB("test")[outColReduce].find().itcount(), "Wrong count");
+        }
+    }
 
-// verify that data is also on secondary
-var primary = s._rs[0].test.liveNodes.master
-var secondaries = s._rs[0].test.liveNodes.slaves
-s._rs[0].test.awaitReplication( 300 * 1000 ); // this can take a while since chunks are moving
-assert.eq( 51200 , primary.getDB("test")[outcol].count() , "Wrong count" );
-for (var i = 0; i < secondaries.length; ++i) {
-	assert.eq( 51200 , secondaries[i].getDB("test")[outcol].count() , "Wrong count" );
-}
-
-jsTestLog( "DONE" )
-
-s.stop()
-
+    s.stop();
+})();

@@ -1,251 +1,202 @@
-// database.h
-
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include "mongo/db/structure/catalog/namespace_details.h"
-#include "mongo/db/storage/extent_manager.h"
-#include "mongo/db/storage/record.h"
-#include "mongo/db/storage_options.h"
+#include <memory>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
-    class Collection;
-    class Extent;
-    class DataFile;
-    class IndexCatalog;
-    class IndexDetails;
+class OperationContext;
 
-    struct CollectionOptions {
-        CollectionOptions() {
-            reset();
-        }
+/**
+ * Represents a logical database containing Collections.
+ *
+ * The semantics for a const Database are that you can mutate individual collections but not add or
+ * remove them.
+ */
+class Database : public Decorable<Database> {
+public:
+    /**
+     * Creates the namespace 'ns' in the database 'db' according to 'options'. If
+     * 'createDefaultIndexes' is true, creates the _id index for the collection (and the system
+     * indexes, in the case of system collections). Creates the collection's _id index according
+     * to 'idIndex', if it is non-empty.  When 'idIndex' is empty, creates the default _id index.
+     */
+    virtual Status userCreateNS(OperationContext* opCtx,
+                                const NamespaceString& fullns,
+                                CollectionOptions collectionOptions,
+                                bool createDefaultIndexes = true,
+                                const BSONObj& idIndex = BSONObj()) const = 0;
 
-        void reset() {
-            capped = false;
-            cappedSize = 0;
-            cappedMaxDocs = 0;
-            initialNumExtents = 0;
-            initialExtentSizes.clear();
-            autoIndexId = DEFAULT;
-            flags = 0;
-            flagsSet = false;
-            temp = false;
-        }
+    Database() = default;
 
-        Status parse( const BSONObj& obj );
-        BSONObj toBSON() const;
+    // must call close first
+    virtual ~Database() = default;
 
-        // ----
+    inline Database(Database&&) = delete;
+    inline Database& operator=(Database&&) = delete;
 
-        bool capped;
-        long long cappedSize;
-        long long cappedMaxDocs;
-
-        // following 2 are mutually exclusive, can only have one set
-        long long initialNumExtents;
-        vector<long long> initialExtentSizes;
-
-        // behavior of _id index creation when collection created
-        void setNoIdIndex() { autoIndexId = NO; }
-        enum {
-            DEFAULT, // currently yes for most collections, NO for some system ones
-            YES, // create _id index
-            NO // do not create _id index
-        } autoIndexId;
-
-        // user flags
-        int flags;
-        bool flagsSet;
-
-        bool temp;
-    };
+    virtual CollectionCatalog::iterator begin(OperationContext* opCtx) const = 0;
+    virtual CollectionCatalog::iterator end(OperationContext* opCtx) const = 0;
 
     /**
-     * Database represents a database database
-     * Each database database has its own set of files -- dbname.ns, dbname.0, dbname.1, ...
-     * NOT memory mapped
-    */
-    class Database {
-    public:
-        // you probably need to be in dbHolderMutex when constructing this
-        Database(const char *nm, /*out*/ bool& newDb,
-                 const string& path = storageGlobalParams.dbpath);
+     * Sets up internal memory structures.
+     */
+    virtual void init(OperationContext* opCtx) const = 0;
 
-        /* you must use this to close - there is essential code in this method that is not in the ~Database destructor.
-           thus the destructor is private.  this could be cleaned up one day...
-        */
-        static void closeDatabase( const string& db, const string& path );
+    // closes files and other cleanup see below.
+    virtual void close(OperationContext* const opCtx) const = 0;
 
-        const string& name() const { return _name; }
-        const string& path() const { return _path; }
+    virtual const std::string& name() const = 0;
 
-        void clearTmpCollections();
+    virtual void clearTmpCollections(OperationContext* const opCtx) const = 0;
 
-        /**
-         * tries to make sure that this hasn't been deleted
-         */
-        bool isOk() const { return _magic == 781231; }
+    /**
+     * Sets a new profiling level for the database and returns the outcome.
+     *
+     * @param opCtx Operation context which to use for creating the profiling collection.
+     * @param newLevel New profiling level to use.
+     */
+    virtual Status setProfilingLevel(OperationContext* const opCtx, const int newLevel) = 0;
 
-        bool isEmpty() { return ! _namespaceIndex.allocated(); }
+    virtual int getProfilingLevel() const = 0;
 
-        /**
-         * total file size of Database in bytes
-         */
-        long long fileSize() const { return _extentManager.fileSize(); }
+    virtual const NamespaceString& getProfilingNS() const = 0;
 
-        int numFiles() const { return _extentManager.numFiles(); }
+    /**
+     * Sets the 'drop-pending' state of this Database.
+     * This is done at the beginning of a dropDatabase operation and is used to reject subsequent
+     * collection creation requests on this database.
+     * The database must be locked in MODE_X when calling this function.
+     */
+    virtual void setDropPending(OperationContext* opCtx, bool dropPending) = 0;
 
-        void getFileFormat( int* major, int* minor );
+    /**
+     * Returns the 'drop-pending' state of this Database.
+     * The database must be locked in MODE_X when calling this function.
+     */
+    virtual bool isDropPending(OperationContext* opCtx) const = 0;
 
-        /**
-         * makes sure we have an extra file at the end that is empty
-         * safe to call this multiple times - the implementation will only preallocate one file
-         */
-        void preallocateAFile() { _extentManager.preallocateAFile(); }
+    virtual void getStats(OperationContext* const opCtx,
+                          BSONObjBuilder* const output,
+                          const double scale = 1) const = 0;
 
-        /**
-         * @return true if success.  false if bad level or error creating profile ns
-         */
-        bool setProfilingLevel( int newLevel , string& errmsg );
+    /**
+     * dropCollection() will refuse to drop system collections. Use dropCollectionEvenIfSystem() if
+     * that is required.
+     *
+     * If we are applying a 'drop' oplog entry on a secondary, 'dropOpTime' will contain the optime
+     * of the oplog entry.
+     *
+     * The caller should hold a DB X lock and ensure there are no index builds in progress on the
+     * collection.
+     * N.B. Namespace argument is passed by value as it may otherwise disappear or change.
+     */
+    virtual Status dropCollection(OperationContext* const opCtx,
+                                  NamespaceString nss,
+                                  repl::OpTime dropOpTime = {}) const = 0;
+    virtual Status dropCollectionEvenIfSystem(OperationContext* const opCtx,
+                                              NamespaceString nss,
+                                              repl::OpTime dropOpTime = {}) const = 0;
 
-        void flushFiles( bool sync ) { return _extentManager.flushFiles( sync ); }
+    virtual Status dropView(OperationContext* const opCtx, NamespaceString viewName) const = 0;
 
-        /**
-         * @return true if ns is part of the database
-         *         ns=foo.bar, db=foo returns true
-         */
-        bool ownsNS( const string& ns ) const {
-            if ( ! startsWith( ns , _name ) )
-                return false;
-            return ns[_name.size()] == '.';
-        }
+    virtual Collection* createCollection(OperationContext* const opCtx,
+                                         const NamespaceString& nss,
+                                         const CollectionOptions& options = CollectionOptions(),
+                                         const bool createDefaultIndexes = true,
+                                         const BSONObj& idIndex = BSONObj()) const = 0;
 
-        const RecordStats& recordStats() const { return _recordStats; }
-        RecordStats& recordStats() { return _recordStats; }
+    virtual Status createView(OperationContext* const opCtx,
+                              const NamespaceString& viewName,
+                              const CollectionOptions& options) const = 0;
 
-        int getProfilingLevel() const { return _profile; }
-        const char* getProfilingNS() const { return _profileName.c_str(); }
+    virtual Collection* getCollection(OperationContext* opCtx,
+                                      const NamespaceString& nss) const = 0;
 
-        const NamespaceIndex& namespaceIndex() const { return _namespaceIndex; }
-        NamespaceIndex& namespaceIndex() { return _namespaceIndex; }
+    virtual Collection* getOrCreateCollection(OperationContext* const opCtx,
+                                              const NamespaceString& nss) const = 0;
 
-        // TODO: do not think this method should exist, so should try and encapsulate better
-        ExtentManager& getExtentManager() { return _extentManager; }
-        const ExtentManager& getExtentManager() const { return _extentManager; }
+    /**
+     * Arguments are passed by value as they otherwise would be changing as result of renaming.
+     */
+    virtual Status renameCollection(OperationContext* const opCtx,
+                                    NamespaceString fromNss,
+                                    NamespaceString toNss,
+                                    const bool stayTemp) const = 0;
 
-        Status dropCollection( const StringData& fullns );
+    virtual const NamespaceString& getSystemViewsName() const = 0;
 
-        Collection* createCollection( const StringData& ns,
-                                      const CollectionOptions& options = CollectionOptions(),
-                                      bool allocateSpace = true,
-                                      bool createDefaultIndexes = true );
+    /**
+     * Generates a collection namespace suitable for creating a temporary collection.
+     * The namespace is based on a model that replaces each percent sign in 'collectionNameModel' by
+     * a random character in the range [0-9A-Za-z].
+     * Returns FailedToParse if 'collectionNameModel' does not contain any percent signs.
+     * Returns NamespaceExists if we are unable to generate a collection name that does not conflict
+     * with an existing collection in this database.
+     *
+     * The database must be locked in MODE_X when calling this function.
+     */
+    virtual StatusWith<NamespaceString> makeUniqueCollectionNamespace(
+        OperationContext* opCtx, StringData collectionNameModel) = 0;
 
-        /**
-         * @param ns - this is fully qualified, which is maybe not ideal ???
-         */
-        Collection* getCollection( const StringData& ns );
+    /**
+     * If we are in a replset, every replicated collection must have an _id index.  As we scan each
+     * database, we also gather a list of drop-pending collection namespaces for the
+     * DropPendingCollectionReaper to clean up eventually.
+     */
+    virtual void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const = 0;
 
-        Collection* getCollection( const NamespaceString& ns ) { return getCollection( ns.ns() ); }
+    /**
+     * A database is assigned a new epoch whenever it is closed and re-opened. This involves
+     * deleting and reallocating a new Database object, so the epoch for a particular Database
+     * instance is immutable.
+     *
+     * Callers of this method must hold the global lock in at least MODE_IS.
+     *
+     * This allows callers which drop and reacquire locks to detect an intervening database close.
+     * For example, closing a database must kill all active queries against the database. This is
+     * implemented by checking that the epoch has not changed during query yield recovery.
+     */
+    virtual uint64_t epoch() const = 0;
+};
 
-        Collection* getOrCreateCollection( const StringData& ns );
-
-        Status renameCollection( const StringData& fromNS, const StringData& toNS, bool stayTemp );
-
-        /**
-         * @return name of an existing database with same text name but different
-         * casing, if one exists.  Otherwise the empty string is returned.  If
-         * 'duplicates' is specified, it is filled with all duplicate names.
-         */
-        static string duplicateUncasedName( bool inholderlockalready, const string &name, const string &path, set< string > *duplicates = 0 );
-
-        static Status validateDBName( const StringData& dbname );
-
-        const string& getSystemIndexesName() const { return _indexesName; }
-    private:
-
-        void _clearCollectionCache( const StringData& fullns );
-
-        void _clearCollectionCache_inlock( const StringData& fullns );
-
-        ~Database(); // closes files and other cleanup see below.
-
-        void _addNamespaceToCatalog( const StringData& ns, const BSONObj* options );
-
-
-        /**
-         * removes from *.system.namespaces
-         * frees extents
-         * removes from NamespaceIndex
-         * NOT RIGHT NOW, removes cache entry in Database TODO?
-         */
-        Status _dropNS( const StringData& ns );
-
-        /**
-         * @throws DatabaseDifferCaseCode if the name is a duplicate based on
-         * case insensitive matching.
-         */
-        void checkDuplicateUncasedNames(bool inholderlockalready) const;
-
-        void openAllFiles();
-
-        Status _renameSingleNamespace( const StringData& fromNS, const StringData& toNS,
-                                       bool stayTemp );
-
-        const string _name; // "alleyinsider"
-        const string _path; // "/data/db"
-
-        NamespaceIndex _namespaceIndex;
-        ExtentManager _extentManager;
-
-        const string _profileName; // "alleyinsider.system.profile"
-        const string _namespacesName; // "alleyinsider.system.namespaces"
-        const string _indexesName; // "alleyinsider.system.indexes"
-
-        RecordStats _recordStats;
-        int _profile; // 0=off.
-
-        int _magic; // used for making sure the object is still loaded in memory
-
-        // TODO: make sure deletes go through
-        // this in some ways is a dupe of _namespaceIndex
-        // but it points to a much more useful data structure
-        typedef StringMap< Collection* > CollectionMap;
-        CollectionMap _collections;
-        mutex _collectionLock;
-
-        friend class Collection;
-        friend class NamespaceDetails;
-        friend class IndexDetails;
-        friend class IndexCatalog;
-    };
-
-} // namespace mongo
+}  // namespace mongo

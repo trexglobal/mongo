@@ -1,893 +1,770 @@
-// @file db.cpp : Defines main() for the mongod program.
-
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
-#include <boost/thread/thread.hpp>
+#include "mongo/platform/basic.h"
+
 #include <boost/filesystem/operations.hpp>
+#include <boost/optional.hpp>
 #include <fstream>
+#include <iostream>
+#include <limits>
+#include <signal.h>
+#include <string>
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
-#include "mongo/db/auth/auth_index_d.h"
-#include "mongo/db/auth/authz_manager_external_state_d.h"
+#include "mongo/client/global_conn_pool.h"
+#include "mongo/client/replica_set_monitor.h"
+#include "mongo/config.h"
+#include "mongo/db/audit.h"
+#include "mongo/db/auth/auth_op_observer.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/sasl_options.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder_impl.h"
+#include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
-#include "mongo/db/commands/server_status.h"
-#include "mongo/db/d_concurrency.h"
-#include "mongo/db/d_globals.h"
-#include "mongo/db/db.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/feature_compatibility_version_gen.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/dbhelpers.h"
 #include "mongo/db/dbmessage.h"
-#include "mongo/db/dbwebserver.h"
-#include "mongo/db/dur.h"
+#include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/free_mon/free_mon_mongod.h"
+#include "mongo/db/ftdc/ftdc_mongod.h"
+#include "mongo/db/global_settings.h"
+#include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/index_names.h"
-#include "mongo/db/index_rebuilder.h"
 #include "mongo/db/initialize_server_global_state.h"
-#include "mongo/db/instance.h"
+#include "mongo/db/initialize_server_security_state.h"
+#include "mongo/db/initialize_snmp.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/json.h"
-#include "mongo/db/kill_current_op.h"
+#include "mongo/db/keys_collection_client_direct.h"
+#include "mongo/db/keys_collection_client_sharded.h"
+#include "mongo/db/keys_collection_manager.h"
+#include "mongo/db/kill_sessions.h"
+#include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_session_cache.h"
+#include "mongo/db/logical_session_cache_factory_mongod.h"
+#include "mongo/db/logical_time_metadata_hook.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/mongod_options.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
+#include "mongo/db/periodic_runner_job_decrease_snapshot_cache_pressure.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/range_deleter_service.h"
-#include "mongo/db/repair_database.h"
-#include "mongo/db/repl/repl_start.h"
-#include "mongo/db/repl/replication_server_status.h"
-#include "mongo/db/repl/rs.h"
-#include "mongo/db/restapi.h"
-#include "mongo/db/startup_warnings.h"
+#include "mongo/db/repair_database_and_check_version.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_consistency_markers_impl.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_external_state_impl.h"
+#include "mongo/db/repl/replication_coordinator_impl.h"
+#include "mongo/db/repl/replication_coordinator_impl_gen.h"
+#include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/replication_recovery.h"
+#include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/repl/topology_coordinator.h"
+#include "mongo/db/repl_set_member_in_standalone_mode.h"
+#include "mongo/db/s/balancer/balancer.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/db/s/op_observer_sharding_impl.h"
+#include "mongo/db/s/shard_server_op_observer.h"
+#include "mongo/db/s/sharding_initialization_mongod.h"
+#include "mongo/db/s/sharding_state_recovery.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_entry_point_mongod.h"
+#include "mongo/db/session_killer.h"
+#include "mongo/db/startup_warnings_mongod.h"
 #include "mongo/db/stats/counters.h"
-#include "mongo/db/stats/snapshots.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/backup_cursor_hooks.h"
+#include "mongo/db/storage/encryption_hooks.h"
+#include "mongo/db/storage/flow_control.h"
+#include "mongo/db/storage/flow_control_parameters_gen.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/storage/storage_engine_lock_file.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/system_index.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/db/ttl.h"
+#include "mongo/db/wire_version.h"
+#include "mongo/executor/network_connection_hook.h"
+#include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/network_interface_thread_pool.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/platform/process_id.h"
-#include "mongo/s/d_writeback.h"
+#include "mongo/platform/random.h"
+#include "mongo/rpc/metadata/egress_metadata_hook_list.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/sharding_initialization.h"
+#include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/stdx/future.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/transport/transport_layer_manager.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
-#include "mongo/util/concurrency/task.h"
+#include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/exception_filter_win32.h"
-#include "mongo/util/file_allocator.h"
-#include "mongo/util/net/message_server.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/fail_point_service.h"
+#include "mongo/util/fast_clock_source_factory.h"
+#include "mongo/util/log.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/periodic_runner.h"
+#include "mongo/util/periodic_runner_factory.h"
+#include "mongo/util/quick_exit.h"
 #include "mongo/util/ramlog.h"
 #include "mongo/util/scopeguard.h"
-#include "mongo/util/signal_win32.h"
+#include "mongo/util/sequence_util.h"
+#include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/text.h"
-#include "mongo/util/version_reporting.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/version.h"
+#include "mongo/watchdog/watchdog_mongod.h"
+
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_options.h"
+#endif
 
 #if !defined(_WIN32)
-# include <sys/file.h>
+#include <sys/file.h>
 #endif
 
 namespace mongo {
 
-    void (*snmpInit)() = NULL;
+using logger::LogComponent;
+using std::endl;
 
-    /* only off if --nohints */
-    extern bool useHints;
+namespace {
 
-    extern int diagLogging;
-    extern int lockFile;
-
-    static void setupSignalHandlers();
-    static void startSignalProcessingThread();
-    void exitCleanly( ExitCode code );
+const NamespaceString startupLogCollectionName("local.startup_log");
 
 #ifdef _WIN32
-    ntservice::NtServiceDefaultStrings defaultServiceStrings = {
-        L"MongoDB",
-        L"MongoDB",
-        L"MongoDB Server"
-    };
+const ntservice::NtServiceDefaultStrings defaultServiceStrings = {
+    L"MongoDB", L"MongoDB", L"MongoDB Server"};
 #endif
 
-    Timer startupSrandTimer;
+void logStartup(OperationContext* opCtx) {
+    BSONObjBuilder toLog;
+    std::stringstream id;
+    id << getHostNameCached() << "-" << jsTime().asInt64();
+    toLog.append("_id", id.str());
+    toLog.append("hostname", getHostNameCached());
 
-    const char *ourgetns() {
-        Client *c = currentClient.get();
-        if ( ! c )
-            return "";
-        Client::Context* cc = c->getContext();
-        return cc ? cc->ns() : "";
+    toLog.appendTimeT("startTime", time(0));
+    toLog.append("startTimeLocal", dateToCtimeString(Date_t::now()));
+
+    toLog.append("cmdLine", serverGlobalParams.parsedOpts);
+    toLog.append("pid", ProcessId::getCurrent().asLongLong());
+
+
+    BSONObjBuilder buildinfo(toLog.subobjStart("buildinfo"));
+    VersionInfoInterface::instance().appendBuildInfo(&buildinfo);
+    appendStorageEngineList(opCtx->getServiceContext(), &buildinfo);
+    buildinfo.doneFast();
+
+    BSONObj o = toLog.obj();
+
+    Lock::GlobalWrite lk(opCtx);
+    AutoGetOrCreateDb autoDb(opCtx, startupLogCollectionName.db(), mongo::MODE_X);
+    Database* db = autoDb.getDb();
+    Collection* collection = db->getCollection(opCtx, startupLogCollectionName);
+    WriteUnitOfWork wunit(opCtx);
+    if (!collection) {
+        BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
+        repl::UnreplicatedWritesBlock uwb(opCtx);
+        CollectionOptions collectionOptions;
+        uassertStatusOK(
+            collectionOptions.parse(options, CollectionOptions::ParseKind::parseForCommand));
+        uassertStatusOK(db->userCreateNS(opCtx, startupLogCollectionName, collectionOptions));
+        collection = db->getCollection(opCtx, startupLogCollectionName);
+    }
+    invariant(collection);
+
+    OpDebug* const nullOpDebug = nullptr;
+    uassertStatusOK(collection->insertDocument(opCtx, InsertStatement(o), nullOpDebug, false));
+    wunit.commit();
+}
+
+void initWireSpec() {
+    WireSpec& spec = WireSpec::instance();
+
+    // The featureCompatibilityVersion behavior defaults to the downgrade behavior while the
+    // in-memory version is unset.
+
+    spec.incomingInternalClient.minWireVersion = RELEASE_2_4_AND_BEFORE;
+    spec.incomingInternalClient.maxWireVersion = LATEST_WIRE_VERSION;
+
+    spec.outgoing.minWireVersion = RELEASE_2_4_AND_BEFORE;
+    spec.outgoing.maxWireVersion = LATEST_WIRE_VERSION;
+
+    spec.isInternalClient = true;
+}
+
+MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
+
+ExitCode _initAndListen(int listenPort) {
+    Client::initThread("initandlisten");
+
+    initWireSpec();
+    auto serviceContext = getGlobalServiceContext();
+
+    serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
+    auto opObserverRegistry = stdx::make_unique<OpObserverRegistry>();
+    opObserverRegistry->addObserver(stdx::make_unique<OpObserverShardingImpl>());
+    opObserverRegistry->addObserver(stdx::make_unique<AuthOpObserver>());
+
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        opObserverRegistry->addObserver(stdx::make_unique<ShardServerOpObserver>());
+    } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        opObserverRegistry->addObserver(stdx::make_unique<ConfigServerOpObserver>());
+    }
+    setupFreeMonitoringOpObserver(opObserverRegistry.get());
+
+
+    serviceContext->setOpObserver(std::move(opObserverRegistry));
+
+    DBDirectClientFactory::get(serviceContext).registerImplementation([](OperationContext* opCtx) {
+        return std::unique_ptr<DBClientBase>(new DBDirectClient(opCtx));
+    });
+
+    const repl::ReplSettings& replSettings =
+        repl::ReplicationCoordinator::get(serviceContext)->getSettings();
+
+    {
+        ProcessId pid = ProcessId::getCurrent();
+        LogstreamBuilder l = log(LogComponent::kControl);
+        l << "MongoDB starting : pid=" << pid << " port=" << serverGlobalParams.port
+          << " dbpath=" << storageGlobalParams.dbpath;
+
+        const bool is32bit = sizeof(int*) == 4;
+        l << (is32bit ? " 32" : " 64") << "-bit host=" << getHostNameCached() << endl;
     }
 
-    struct MyStartupTests {
-        MyStartupTests() {
-            verify( sizeof(OID) == 12 );
-        }
-    } mystartupdbcpp;
+    DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
 
-    QueryResult* emptyMoreResult(long long);
-
-
-    /* todo: make this a real test.  the stuff in dbtests/ seem to do all dbdirectclient which exhaust doesn't support yet. */
-// QueryOption_Exhaust
-#define TESTEXHAUST 0
-#if( TESTEXHAUST )
-    void testExhaust() {
-        sleepsecs(1);
-        unsigned n = 0;
-        auto f = [&n](const BSONObj& o) {
-            verify( o.valid() );
-            //cout << o << endl;
-            n++;
-            bool testClosingSocketOnError = false;
-            if( testClosingSocketOnError )
-                verify(false);
-        };
-        DBClientConnection db(false);
-        db.connect("localhost");
-        const char *ns = "local.foo";
-        if( db.count(ns) < 10000 )
-            for( int i = 0; i < 20000; i++ )
-                db.insert(ns, BSON("aaa" << 3 << "b" << "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-
-        try {
-            db.query(f, ns, Query() );
-        }
-        catch(...) {
-            cout << "hmmm" << endl;
-        }
-
-        try {
-            db.query(f, ns, Query() );
-        }
-        catch(...) {
-            cout << "caught" << endl;
-        }
-
-        cout << n << endl;
-    };
-#endif
-
-    /* if server is really busy, wait a bit */
-    void beNice() {
-        sleepmicros( Client::recommendedYieldMicros() );
-    }
-
-    class MyMessageHandler : public MessageHandler {
-    public:
-        virtual void connected( AbstractMessagingPort* p ) {
-            Client::initThread("conn", p);
-        }
-
-        virtual void process( Message& m , AbstractMessagingPort* port , LastError * le) {
-            while ( true ) {
-                if ( inShutdown() ) {
-                    log() << "got request after shutdown()" << endl;
-                    break;
-                }
-
-                lastError.startRequest( m , le );
-
-                DbResponse dbresponse;
-                try {
-                    assembleResponse( m, dbresponse, port->remote() );
-                }
-                catch ( const ClockSkewException & ) {
-                    log() << "ClockSkewException - shutting down" << endl;
-                    exitCleanly( EXIT_CLOCK_SKEW );
-                }
-
-                if ( dbresponse.response ) {
-                    port->reply(m, *dbresponse.response, dbresponse.responseTo);
-                    if( dbresponse.exhaustNS.size() > 0 ) {
-                        MsgData *header = dbresponse.response->header();
-                        QueryResult *qr = (QueryResult *) header;
-                        long long cursorid = qr->cursorId;
-                        if( cursorid ) {
-                            verify( dbresponse.exhaustNS.size() && dbresponse.exhaustNS[0] );
-                            string ns = dbresponse.exhaustNS; // before reset() free's it...
-                            m.reset();
-                            BufBuilder b(512);
-                            b.appendNum((int) 0 /*size set later in appendData()*/);
-                            b.appendNum(header->id);
-                            b.appendNum(header->responseTo);
-                            b.appendNum((int) dbGetMore);
-                            b.appendNum((int) 0);
-                            b.appendStr(ns);
-                            b.appendNum((int) 0); // ntoreturn
-                            b.appendNum(cursorid);
-                            m.appendData(b.buf(), b.len());
-                            b.decouple();
-                            DEV log() << "exhaust=true sending more" << endl;
-                            beNice();
-                            continue; // this goes back to top loop
-                        }
-                    }
-                }
-                break;
-            }
-        }
-
-        virtual void disconnected( AbstractMessagingPort* p ) {
-            Client * c = currentClient.get();
-            if( c ) c->shutdown();
-        }
-
-    };
-
-    void logStartup() {
-        BSONObjBuilder toLog;
-        stringstream id;
-        id << getHostNameCached() << "-" << jsTime();
-        toLog.append( "_id", id.str() );
-        toLog.append( "hostname", getHostNameCached() );
-
-        toLog.appendTimeT( "startTime", time(0) );
-        toLog.append( "startTimeLocal", dateToCtimeString(curTimeMillis64()) );
-
-        toLog.append("cmdLine", serverGlobalParams.parsedOpts);
-        toLog.append( "pid", ProcessId::getCurrent().asLongLong() );
-
-
-        BSONObjBuilder buildinfo( toLog.subobjStart("buildinfo"));
-        appendBuildInfo(buildinfo);
-        buildinfo.doneFast();
-
-        BSONObj o = toLog.obj();
-
-        Lock::GlobalWrite lk;
-        DBDirectClient c;
-        const char* name = "local.startup_log";
-        c.createCollection( name, 10 * 1024 * 1024, true );
-        c.insert( name, o);
-    }
-
-    void listen(int port) {
-        //testTheDb();
-        MessageServer::Options options;
-        options.port = port;
-        options.ipList = serverGlobalParams.bind_ip;
-
-        MessageServer * server = createServer( options , new MyMessageHandler() );
-        server->setAsTimeTracker();
-        // we must setupSockets prior to logStartup() to avoid getting too high
-        // a file descriptor for our calls to select()
-        server->setupSockets();
-
-        logStartup();
-        startReplication();
-        if (serverGlobalParams.isHttpInterfaceEnabled)
-            boost::thread web( boost::bind(&webServerThread, new RestAdminAccess() /* takes ownership */));
-
-#if(TESTEXHAUST)
-        boost::thread thr(testExhaust);
-#endif
-        server->run();
-    }
-
-
-    void doDBUpgrade( const string& dbName, DataFileHeader* h ) {
-        static DBDirectClient db;
-
-        if ( h->version == 4 && h->versionMinor == 4 ) {
-            verify( PDFILE_VERSION == 4 );
-            verify( PDFILE_VERSION_MINOR_22_AND_OLDER == 5 );
-
-            list<string> colls = db.getCollectionNames( dbName );
-            for ( list<string>::iterator i=colls.begin(); i!=colls.end(); i++) {
-                string c = *i;
-                log() << "\t upgrading collection:" << c << endl;
-                BSONObj out;
-                bool ok = db.runCommand( dbName , BSON( "reIndex" << c.substr( dbName.size() + 1 ) ) , out );
-                if ( ! ok ) {
-                    log() << "\t\t reindex failed: " << out;
-                    fassertFailed( 17393 );
-                }
-            }
-
-            getDur().writingInt(h->versionMinor) = 5;
-            return;
-        }
-
-        // do this in the general case
-        fassert( 17401, repairDatabase( dbName ) );
-    }
-
-    void checkForIdIndexes( Database* db ) {
-
-        if ( db->name() == "local") {
-            // we do not need an _id index on anything in the local database
-            return;
-        }
-
-        list<string> collections;
-        db->namespaceIndex().getNamespaces( collections );
-
-        // for each collection, ensure there is a $_id_ index
-        for (list<string>::iterator i = collections.begin(); i != collections.end(); ++i) {
-            const string& collectionName = *i;
-            NamespaceString ns( collectionName );
-            if ( ns.isSystem() )
-                continue;
-
-            Collection* coll = db->getCollection( collectionName );
-            if ( !coll )
-                continue;
-
-            if ( coll->getIndexCatalog()->findIdIndex() )
-                continue;
-
-            log() << "WARNING: the collection '" << *i
-                  << "' lacks a unique index on _id."
-                  << " This index is needed for replication to function properly"
-                  << startupWarningsLog;
-            log() << "\t To fix this, on the primary run 'db." << i->substr(i->find('.')+1)
-                  << ".createIndex({_id: 1}, {unique: true})'"
-                  << startupWarningsLog;
-        }
-    }
-
-    // ran at startup.
-    static void repairDatabasesAndCheckVersion(bool shouldClearNonLocalTmpCollections) {
-        //        LastError * le = lastError.get( true );
-        LOG(1) << "enter repairDatabases (to check pdfile version #)" << endl;
-
-        Lock::GlobalWrite lk;
-        vector< string > dbNames;
-        getDatabaseNames( dbNames );
-        for ( vector< string >::iterator i = dbNames.begin(); i != dbNames.end(); ++i ) {
-            string dbName = *i;
-            LOG(1) << "\t" << dbName << endl;
-
-            Client::Context ctx( dbName );
-            DataFile *p = ctx.db()->getExtentManager().getFile( 0 );
-            DataFileHeader *h = p->getHeader();
-
-            if ( replSettings.usingReplSets() ) {
-                // we only care about the _id index if we are in a replset
-                checkForIdIndexes(ctx.db());
-            }
-
-            if (shouldClearNonLocalTmpCollections || dbName == "local")
-                ctx.db()->clearTmpCollections();
-
-            if (!h->isCurrentVersion() || mongodGlobalParams.repair) {
-
-                if( h->version <= 0 ) {
-                    uasserted(14026,
-                      str::stream() << "db " << dbName << " appears corrupt pdfile version: " << h->version
-                                    << " info: " << h->versionMinor << ' ' << h->fileLength);
-                }
-
-                if ( !h->isCurrentVersion() ) {
-                    log() << "****" << endl;
-                    log() << "****" << endl;
-                    log() << "need to upgrade database " << dbName << " "
-                          << "with pdfile version " << h->version << "." << h->versionMinor << ", "
-                          << "new version: "
-                          << PDFILE_VERSION << "." << PDFILE_VERSION_MINOR_22_AND_OLDER
-                          << endl;
-                }
-
-                if (mongodGlobalParams.upgrade) {
-                    // QUESTION: Repair even if file format is higher version than code?
-                    doDBUpgrade( dbName, h );
-                }
-                else {
-                    log() << "\t Not upgrading, exiting" << endl;
-                    log() << "\t run --upgrade to upgrade dbs, then start again" << endl;
-                    log() << "****" << endl;
-                    dbexit( EXIT_NEED_UPGRADE );
-                    mongodGlobalParams.upgrade = 1;
-                    return;
-                }
-            }
-            else {
-                const string systemIndexes = cc().database()->name() + ".system.indexes";
-                auto_ptr<Runner> runner(InternalPlanner::collectionScan(systemIndexes));
-                BSONObj index;
-                Runner::RunnerState state;
-                while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&index, NULL))) {
-                    const BSONObj key = index.getObjectField("key");
-                    const string plugin = IndexNames::findPluginName(key);
-
-                    if (h->versionMinor == PDFILE_VERSION_MINOR_22_AND_OLDER) {
-                        if (IndexNames::existedBefore24(plugin))
-                            continue;
-
-                        log() << "Index " << index << " claims to be of type '" << plugin << "', "
-                              << "which is either invalid or did not exist before v2.4. "
-                              << "See the upgrade section: "
-                              << "http://dochub.mongodb.org/core/upgrade-2.4"
-                              << startupWarningsLog;
-                    }
-
-                    const Status keyStatus = validateKeyPattern(key);
-                    if (!keyStatus.isOK()) {
-                        log() << "Problem with index " << index << ": " << keyStatus.reason()
-                              << " This index can still be used however it cannot be rebuilt."
-                              << " For more info see"
-                              << " http://dochub.mongodb.org/core/index-validation"
-                              << startupWarningsLog;
-                    }
-                }
-
-                if (Runner::RUNNER_EOF != state) {
-                    warning() << "Internal error while reading collection " << systemIndexes;
-                }
-
-                Database::closeDatabase(dbName.c_str(), storageGlobalParams.dbpath);
-            }
-        }
-
-        LOG(1) << "done repairDatabases" << endl;
-
-        if (mongodGlobalParams.upgrade) {
-            log() << "finished checking dbs" << endl;
-            cc().shutdown();
-            dbexit( EXIT_CLEAN );
-        }
-    }
-
-    void clearTmpFiles() {
-        boost::filesystem::path path(storageGlobalParams.dbpath);
-        for ( boost::filesystem::directory_iterator i( path );
-                i != boost::filesystem::directory_iterator(); ++i ) {
-            string fileName = boost::filesystem::path(*i).leaf().string();
-            if ( boost::filesystem::is_directory( *i ) &&
-                    fileName.length() && fileName[ 0 ] == '$' )
-                boost::filesystem::remove_all( *i );
-        }
-    }
-
-    /**
-     * Checks if this server was started without --replset but has a config in local.system.replset
-     * (meaning that this is probably a replica set member started in stand-alone mode).
-     *
-     * @returns the number of documents in local.system.replset or 0 if this was started with
-     *          --replset.
-     */
-    unsigned long long checkIfReplMissingFromCommandLine() {
-        Lock::GlobalWrite lk; // this is helpful for the query below to work as you can't open files when readlocked
-        if (!replSettings.usingReplSets()) {
-            DBDirectClient c;
-            return c.count("local.system.replset");
-        }
-        return 0;
-    }
-
-    /**
-     * does background async flushes of mmapped files
-     */
-    class DataFileSync : public BackgroundJob , public ServerStatusSection {
-    public:
-        DataFileSync()
-            : ServerStatusSection( "backgroundFlushing" ),
-              _total_time( 0 ),
-              _flushes( 0 ),
-              _last() {
-        }
-
-        virtual bool includeByDefault() const { return true; }
-
-        string name() const { return "DataFileSync"; }
-
-        void run() {
-            Client::initThread( name().c_str() );
-            if (storageGlobalParams.syncdelay == 0) {
-                log() << "warning: --syncdelay 0 is not recommended and can have strange performance" << endl;
-            }
-            else if (storageGlobalParams.syncdelay == 1) {
-                log() << "--syncdelay 1" << endl;
-            }
-            else if (storageGlobalParams.syncdelay != 60) {
-                LOG(1) << "--syncdelay " << storageGlobalParams.syncdelay << endl;
-            }
-            int time_flushing = 0;
-            while ( ! inShutdown() ) {
-                _diaglog.flush();
-                if (storageGlobalParams.syncdelay == 0) {
-                    // in case at some point we add an option to change at runtime
-                    sleepsecs(5);
-                    continue;
-                }
-
-                sleepmillis((long long) std::max(0.0, (storageGlobalParams.syncdelay * 1000) - time_flushing));
-
-                if ( inShutdown() ) {
-                    // occasional issue trying to flush during shutdown when sleep interrupted
-                    break;
-                }
-
-                Date_t start = jsTime();
-                int numFiles = MemoryMappedFile::flushAll( true );
-                time_flushing = (int) (jsTime() - start);
-
-                _flushed(time_flushing);
-
-                if( logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1)) || time_flushing >= 10000 ) {
-                    log() << "flushing mmaps took " << time_flushing << "ms " << " for " << numFiles << " files" << endl;
-                }
-            }
-        }
-
-        BSONObj generateSection(const BSONElement& configElement) const {
-            BSONObjBuilder b;
-            b.appendNumber( "flushes" , _flushes );
-            b.appendNumber( "total_ms" , _total_time );
-            b.appendNumber( "average_ms" , (_flushes ? (_total_time / double(_flushes)) : 0.0) );
-            b.appendNumber( "last_ms" , _last_time );
-            b.append("last_finished", _last);
-            return b.obj();
-        }
-
-    private:
-
-        void _flushed(int ms) {
-            _flushes++;
-            _total_time += ms;
-            _last_time = ms;
-            _last = jsTime();
-        }
-
-        long long _total_time;
-        long long _flushes;
-        int _last_time;
-        Date_t _last;
-
-
-    } dataFileSync;
-
-    namespace {
-        class MemJournalServerStatusMetric : public ServerStatusMetric {
-        public:
-            MemJournalServerStatusMetric() : ServerStatusMetric(".mem.mapped") {}
-            virtual void appendAtLeaf( BSONObjBuilder& b ) const {
-                int m = static_cast<int>(MemoryMappedFile::totalMappedLength() / ( 1024 * 1024 ));
-                b.appendNumber( "mapped" , m );
-
-                if (storageGlobalParams.dur) {
-                    m *= 2;
-                    b.appendNumber( "mappedWithJournal" , m );
-                }
-
-            }
-        } memJournalServerStatusMetric;
-    }
-
-
-    const char * jsInterruptCallback() {
-        // should be safe to interrupt in js code, even if we have a write lock
-        return killCurrentOp.checkForInterruptNoAssert();
-    }
-
-    unsigned jsGetCurrentOpIdCallback() {
-        return cc().curop()->opNum();
-    }
-
-    /// warn if readahead > 256KB (gridfs chunk size)
-    static void checkReadAhead(const string& dir) {
-#ifdef __linux__
-        try {
-            const dev_t dev = getPartition(dir);
-
-            // This path handles the case where the filesystem uses the whole device (including LVM)
-            string path = str::stream() <<
-                "/sys/dev/block/" << major(dev) << ':' << minor(dev) << "/queue/read_ahead_kb";
-
-            if (!boost::filesystem::exists(path)){
-                // This path handles the case where the filesystem is on a partition.
-                path = str::stream()
-                    << "/sys/dev/block/" << major(dev) << ':' << minor(dev) // this is a symlink
-                    << "/.." // parent directory of a partition is for the whole device
-                    << "/queue/read_ahead_kb";
-            }
-
-            if (boost::filesystem::exists(path)) {
-                ifstream file (path.c_str());
-                if (file.is_open()) {
-                    int kb;
-                    file >> kb;
-                    if (kb > 256) {
-                        log() << startupWarningsLog;
-
-                        log() << "** WARNING: Readahead for " << dir << " is set to " << kb << "KB"
-                                << startupWarningsLog;
-
-                        log() << "**          We suggest setting it to 256KB (512 sectors) or less"
-                                << startupWarningsLog;
-
-                        log() << "**          http://dochub.mongodb.org/core/readahead"
-                                << startupWarningsLog;
-                    }
-                }
-            }
-        }
-        catch (const std::exception& e) {
-            log() << "unable to validate readahead settings due to error: " << e.what()
-                  << startupWarningsLog;
-            log() << "for more information, see http://dochub.mongodb.org/core/readahead"
-                  << startupWarningsLog;
-        }
-#endif // __linux__
-    }
-
-    void _initAndListen(int listenPort ) {
-
-        Client::initThread("initandlisten");
-
-        bool is32bit = sizeof(int*) == 4;
-
-        {
-            ProcessId pid = ProcessId::getCurrent();
-            LogstreamBuilder l = log();
-            l << "MongoDB starting : pid=" << pid
-              << " port=" << serverGlobalParams.port
-              << " dbpath=" << storageGlobalParams.dbpath;
-            if( replSettings.master ) l << " master=" << replSettings.master;
-            if( replSettings.slave )  l << " slave=" << (int) replSettings.slave;
-            l << ( is32bit ? " 32" : " 64" ) << "-bit host=" << getHostNameCached() << endl;
-        }
-        DEV log() << "_DEBUG build (which is slower)" << endl;
-        logStartupWarnings();
 #if defined(_WIN32)
-        printTargetMinOS();
+    VersionInfoInterface::instance().logTargetMinOS();
 #endif
-        logProcessDetails();
-        {
-            stringstream ss;
-            ss << endl;
-            ss << "*********************************************************************" << endl;
-            ss << " ERROR: dbpath (" << storageGlobalParams.dbpath << ") does not exist." << endl;
-            ss << " Create this directory or give existing directory in --dbpath." << endl;
-            ss << " See http://dochub.mongodb.org/core/startingandstoppingmongo" << endl;
-            ss << "*********************************************************************" << endl;
-            uassert(10296,  ss.str().c_str(), boost::filesystem::exists(storageGlobalParams.dbpath));
-        }
-        {
-            stringstream ss;
-            ss << "repairpath (" << storageGlobalParams.repairpath << ") does not exist";
-            uassert(12590,  ss.str().c_str(),
-                    boost::filesystem::exists(storageGlobalParams.repairpath));
-        }
 
-        // TODO check non-journal subdirs if using directory-per-db
-        checkReadAhead(storageGlobalParams.dbpath);
+    logProcessDetails();
 
-        acquirePathLock(mongodGlobalParams.repair);
+    serviceContext->setServiceEntryPoint(
+        stdx::make_unique<ServiceEntryPointMongod>(serviceContext));
+
+    if (!storageGlobalParams.repair) {
+        auto tl =
+            transport::TransportLayerManager::createWithConfig(&serverGlobalParams, serviceContext);
+        auto res = tl->setup();
+        if (!res.isOK()) {
+            error() << "Failed to set up listener: " << res;
+            return EXIT_NET_ERROR;
+        }
+        serviceContext->setTransportLayer(std::move(tl));
+    }
+
+    // Set up the periodic runner for background job execution. This is required to be running
+    // before the storage engine is initialized.
+    auto runner = makePeriodicRunner(serviceContext);
+    runner->startup();
+    serviceContext->setPeriodicRunner(std::move(runner));
+    FlowControl::set(serviceContext,
+                     stdx::make_unique<FlowControl>(
+                         serviceContext, repl::ReplicationCoordinator::get(serviceContext)));
+
+    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
+
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
+    if (EncryptionHooks::get(serviceContext)->restartRequired()) {
+        exitCleanly(EXIT_CLEAN);
+    }
+#endif
+
+    // Warn if we detect configurations for multiple registered storage engines in the same
+    // configuration file/environment.
+    if (serverGlobalParams.parsedOpts.hasField("storage")) {
+        BSONElement storageElement = serverGlobalParams.parsedOpts.getField("storage");
+        invariant(storageElement.isABSONObj());
+        for (auto&& e : storageElement.Obj()) {
+            // Ignore if field name under "storage" matches current storage engine.
+            if (storageGlobalParams.engine == e.fieldName()) {
+                continue;
+            }
+
+            // Warn if field name matches non-active registered storage engine.
+            if (isRegisteredStorageEngine(serviceContext, e.fieldName())) {
+                warning() << "Detected configuration for non-active storage engine "
+                          << e.fieldName() << " when current storage engine is "
+                          << storageGlobalParams.engine;
+            }
+        }
+    }
+
+    // Disallow running a storage engine that doesn't support capped collections with --profile
+    if (!serviceContext->getStorageEngine()->supportsCappedCollections() &&
+        serverGlobalParams.defaultProfile != 0) {
+        log() << "Running " << storageGlobalParams.engine << " with profiling is not supported. "
+              << "Make sure you are not using --profile.";
+        exitCleanly(EXIT_BADOPTIONS);
+    }
+
+    // Disallow running WiredTiger with --nojournal in a replica set
+    if (storageGlobalParams.engine == "wiredTiger" && !storageGlobalParams.dur &&
+        replSettings.usingReplSets()) {
+        log() << "Running wiredTiger without journaling in a replica set is not "
+              << "supported. Make sure you are not using --nojournal and that "
+              << "storage.journal.enabled is not set to 'false'.";
+        exitCleanly(EXIT_BADOPTIONS);
+    }
+
+    logMongodStartupWarnings(storageGlobalParams, serverGlobalParams, serviceContext);
+
+#ifdef MONGO_CONFIG_SSL
+    if (sslGlobalParams.sslAllowInvalidCertificates &&
+        ((serverGlobalParams.clusterAuthMode.load() == ServerGlobalParams::ClusterAuthMode_x509) ||
+         sequenceContains(saslGlobalParams.authenticationMechanisms, "MONGODB-X509"))) {
+        log() << "** WARNING: While invalid X509 certificates may be used to" << startupWarningsLog;
+        log() << "**          connect to this server, they will not be considered"
+              << startupWarningsLog;
+        log() << "**          permissible for authentication." << startupWarningsLog;
+        log() << startupWarningsLog;
+    }
+#endif
+
+    {
+        std::stringstream ss;
+        ss << endl;
+        ss << "*********************************************************************" << endl;
+        ss << " ERROR: dbpath (" << storageGlobalParams.dbpath << ") does not exist." << endl;
+        ss << " Create this directory or give existing directory in --dbpath." << endl;
+        ss << " See http://dochub.mongodb.org/core/startingandstoppingmongo" << endl;
+        ss << "*********************************************************************" << endl;
+        uassert(10296, ss.str().c_str(), boost::filesystem::exists(storageGlobalParams.dbpath));
+    }
+
+    initializeSNMP();
+
+    startWatchdog();
+
+    if (!storageGlobalParams.readOnly) {
         boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/");
+    }
 
-        FileAllocator::get()->start();
+    if (mongodGlobalParams.scriptingEnabled) {
+        ScriptEngine::setup();
+    }
 
-        // TODO:  This should go into a MONGO_INITIALIZER once we have figured out the correct
-        // dependencies.
-        if (snmpInit) {
-            snmpInit();
+    auto startupOpCtx = serviceContext->makeOperationContext(&cc());
+
+    bool canCallFCVSetIfCleanStartup =
+        !storageGlobalParams.readOnly && (storageGlobalParams.engine != "devnull");
+    if (canCallFCVSetIfCleanStartup && !replSettings.usingReplSets()) {
+        Lock::GlobalWrite lk(startupOpCtx.get());
+        FeatureCompatibilityVersion::setIfCleanStartup(startupOpCtx.get(),
+                                                       repl::StorageInterface::get(serviceContext));
+    }
+
+    bool nonLocalDatabases;
+    try {
+        nonLocalDatabases = repairDatabasesAndCheckVersion(startupOpCtx.get());
+    } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
+        severe(LogComponent::kControl) << "** IMPORTANT: " << error.toStatus().reason();
+        exitCleanly(EXIT_NEED_DOWNGRADE);
+    }
+
+    // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set. If
+    // we are part of a replica set and are started up with no data files, we do not set the
+    // featureCompatibilityVersion until a primary is chosen. For this case, we expect the in-memory
+    // featureCompatibilityVersion parameter to still be uninitialized until after startup.
+    if (canCallFCVSetIfCleanStartup && (!replSettings.usingReplSets() || nonLocalDatabases)) {
+        invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
+    }
+
+    if (gFlowControlEnabled.load()) {
+        log() << "Flow Control is enabled on this deployment.";
+    }
+
+    if (storageGlobalParams.upgrade) {
+        log() << "finished checking dbs";
+        exitCleanly(EXIT_CLEAN);
+    }
+
+    // Start up health log writer thread.
+    HealthLog::get(startupOpCtx.get()).startup();
+
+    auto const globalAuthzManager = AuthorizationManager::get(serviceContext);
+    uassertStatusOK(globalAuthzManager->initialize(startupOpCtx.get()));
+
+    // This is for security on certain platforms (nonce generation)
+    srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));
+
+    if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
+        Status status = verifySystemIndexes(startupOpCtx.get());
+        if (!status.isOK()) {
+            log() << redact(status);
+            if (status == ErrorCodes::AuthSchemaIncompatible) {
+                exitCleanly(EXIT_NEED_UPGRADE);
+            } else if (status == ErrorCodes::NotMaster) {
+                // Try creating the indexes if we become master.  If we do not become master,
+                // the master will create the indexes and we will replicate them.
+            } else {
+                quickExit(EXIT_FAILURE);
+            }
         }
 
-        MONGO_ASSERT_ON_EXCEPTION_WITH_MSG( clearTmpFiles(), "clear tmp files" );
+        // SERVER-14090: Verify that auth schema version is schemaVersion26Final.
+        int foundSchemaVersion;
+        status =
+            globalAuthzManager->getAuthorizationVersion(startupOpCtx.get(), &foundSchemaVersion);
+        if (!status.isOK()) {
+            log() << "Auth schema version is incompatible: "
+                  << "User and role management commands require auth data to have "
+                  << "at least schema version " << AuthorizationManager::schemaVersion26Final
+                  << " but startup could not verify schema version: " << status;
+            log() << "To manually repair the 'authSchema' document in the admin.system.version "
+                     "collection, start up with --setParameter "
+                     "startupAuthSchemaValidation=false to disable validation.";
+            exitCleanly(EXIT_NEED_UPGRADE);
+        }
 
-        dur::startup();
+        if (foundSchemaVersion <= AuthorizationManager::schemaVersion26Final) {
+            log() << "This server is using MONGODB-CR, an authentication mechanism which "
+                  << "has been removed from MongoDB 4.0. In order to upgrade the auth schema, "
+                  << "first downgrade MongoDB binaries to version 3.6 and then run the "
+                  << "authSchemaUpgrade command. "
+                  << "See http://dochub.mongodb.org/core/3.0-upgrade-to-scram-sha-1";
+            exitCleanly(EXIT_NEED_UPGRADE);
+        }
+    } else if (globalAuthzManager->isAuthEnabled()) {
+        error() << "Auth must be disabled when starting without auth schema validation";
+        exitCleanly(EXIT_BADOPTIONS);
+    } else {
+        // If authSchemaValidation is disabled and server is running without auth,
+        // warn the user and continue startup without authSchema metadata checks.
+        log() << startupWarningsLog;
+        log() << "** WARNING: Startup auth schema validation checks are disabled for the "
+                 "database."
+              << startupWarningsLog;
+        log() << "**          This mode should only be used to manually repair corrupted auth "
+                 "data."
+              << startupWarningsLog;
+    }
 
-        if (storageGlobalParams.durOptions & StorageGlobalParams::DurRecoverOnly)
-            return;
+    // This function may take the global lock.
+    auto shardingInitialized = ShardingInitializationMongoD::get(startupOpCtx.get())
+                                   ->initializeShardingAwarenessIfNeeded(startupOpCtx.get());
+    if (shardingInitialized) {
+        auto status = waitForShardRegistryReload(startupOpCtx.get());
+        if (!status.isOK()) {
+            LOG(0) << "Failed to load the shard registry as part of startup"
+                   << causedBy(redact(status));
+        }
+    }
 
-        unsigned long long missingRepl = checkIfReplMissingFromCommandLine();
-        if (missingRepl) {
+    auto storageEngine = serviceContext->getStorageEngine();
+    invariant(storageEngine);
+    BackupCursorHooks::initialize(serviceContext, storageEngine);
+
+    if (!storageGlobalParams.readOnly) {
+
+        if (storageEngine->supportsCappedCollections()) {
+            logStartup(startupOpCtx.get());
+        }
+
+        startMongoDFTDC();
+
+        startFreeMonitoring(serviceContext);
+
+        auto replCoord = repl::ReplicationCoordinator::get(startupOpCtx.get());
+        invariant(replCoord);
+        if (replCoord->isReplEnabled()) {
+            storageEngine->setOldestActiveTransactionTimestampCallback(
+                TransactionParticipant::getOldestActiveTimestamp);
+        }
+
+        if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+            // Note: For replica sets, ShardingStateRecovery happens on transition to primary.
+            if (!replCoord->isReplEnabled()) {
+                if (ShardingState::get(startupOpCtx.get())->enabled()) {
+                    uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
+                }
+            }
+        } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+            initializeGlobalShardingStateForMongoD(startupOpCtx.get(),
+                                                   ConnectionString::forLocal(),
+                                                   kDistLockProcessIdForConfigServer);
+
+            Balancer::create(startupOpCtx->getServiceContext());
+
+            ShardingCatalogManager::create(
+                startupOpCtx->getServiceContext(),
+                makeShardingTaskExecutor(executor::makeNetworkInterface("AddShard-TaskExecutor")));
+
+            Grid::get(startupOpCtx.get())->setShardingInitialized();
+        } else if (replSettings.usingReplSets()) {  // standalone replica set
+            auto keysCollectionClient = stdx::make_unique<KeysCollectionClientDirect>();
+            auto keyManager = std::make_shared<KeysCollectionManager>(
+                KeysCollectionManager::kKeyManagerPurposeString,
+                std::move(keysCollectionClient),
+                Seconds(KeysRotationIntervalSec));
+            keyManager->startMonitoring(startupOpCtx->getServiceContext());
+
+            LogicalTimeValidator::set(startupOpCtx->getServiceContext(),
+                                      stdx::make_unique<LogicalTimeValidator>(keyManager));
+        }
+
+        replCoord->startup(startupOpCtx.get());
+        if (getReplSetMemberInStandaloneMode(serviceContext)) {
             log() << startupWarningsLog;
-            log() << "** WARNING: mongod started without --replSet yet " << missingRepl
-                  << " documents are present in local.system.replset" << startupWarningsLog;
-            log() << "**          Restart with --replSet unless you are doing maintenance and no"
-                  << " other clients are connected." << startupWarningsLog;
-            log() << "**          The TTL collection monitor will not start because of this." << startupWarningsLog;
-            log() << "**          For more info see http://dochub.mongodb.org/core/ttlcollections" << startupWarningsLog;
+            log() << "** WARNING: mongod started without --replSet yet document(s) are present in "
+                  << NamespaceString::kSystemReplSetNamespace << "." << startupWarningsLog;
+            log() << "**          Database contents may appear inconsistent with the oplog and may "
+                     "appear to not contain"
+                  << startupWarningsLog;
+            log() << "**          writes that were visible when this node was running as part of a "
+                     "replica set."
+                  << startupWarningsLog;
+            log() << "**          Restart with --replSet unless you are doing maintenance and no "
+                     "other clients are connected."
+                  << startupWarningsLog;
+            log() << "**          The TTL collection monitor will not start because of this."
+                  << startupWarningsLog;
+            log() << "**         ";
+            log() << " For more info see http://dochub.mongodb.org/core/ttlcollections";
             log() << startupWarningsLog;
+        } else {
+            startTTLBackgroundJob(serviceContext);
         }
 
-        if (mongodGlobalParams.scriptingEnabled) {
-            ScriptEngine::setup();
-            globalScriptEngine->setCheckInterruptCallback( jsInterruptCallback );
-            globalScriptEngine->setGetCurrentOpIdCallback( jsGetCurrentOpIdCallback );
+        if (replSettings.usingReplSets() || !gInternalValidateFeaturesAsMaster) {
+            serverGlobalParams.validateFeaturesAsMaster.store(false);
         }
+    }
 
-        // On replica set members we only clear temp collections on DBs other than "local" during
-        // promotion to primary. On pure slaves, they are only cleared when the oplog tells them to.
-        // The local DB is special because it is not replicated.  See SERVER-10927 for more details.
-        const bool shouldClearNonLocalTmpCollections = !(missingRepl
-                                                         || replSettings.usingReplSets()
-                                                         || replSettings.slave == SimpleSlave);
-        repairDatabasesAndCheckVersion(shouldClearNonLocalTmpCollections);
+    startClientCursorMonitor();
 
-        if (mongodGlobalParams.upgrade)
-            return;
+    PeriodicTask::startRunningPeriodicTasks();
 
-        uassertStatusOK(getGlobalAuthorizationManager()->initialize());
+    SessionKiller::set(serviceContext,
+                       std::make_shared<SessionKiller>(serviceContext, killSessionsLocal));
 
-        /* this is for security on certain platforms (nonce generation) */
-        srand((unsigned) (curTimeMicros() ^ startupSrandTimer.micros()));
+    // Start up a background task to periodically check for and kill expired transactions; and a
+    // background task to periodically check for and decrease cache pressure by decreasing the
+    // target size setting for the storage engine's window of available snapshots.
+    //
+    // Only do this on storage engines supporting snapshot reads, which hold resources we wish to
+    // release periodically in order to avoid storage cache pressure build up.
+    if (storageEngine->supportsReadConcernSnapshot()) {
+        startPeriodicThreadToAbortExpiredTransactions(serviceContext);
+        startPeriodicThreadToDecreaseSnapshotHistoryIfNotNeeded(serviceContext);
+    }
 
-        snapshotThread.go();
-        d.clientCursorMonitor.go();
-        PeriodicTask::startRunningPeriodicTasks();
-        if (missingRepl) {
-            // a warning was logged earlier
+    // Set up the logical session cache
+    LogicalSessionCacheServer kind = LogicalSessionCacheServer::kStandalone;
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        kind = LogicalSessionCacheServer::kSharded;
+    } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        kind = LogicalSessionCacheServer::kConfigServer;
+    } else if (replSettings.usingReplSets()) {
+        kind = LogicalSessionCacheServer::kReplicaSet;
+    }
+
+    LogicalSessionCache::set(serviceContext, makeLogicalSessionCacheD(kind));
+
+    // MessageServer::run will return when exit code closes its socket and we don't need the
+    // operation context anymore
+    startupOpCtx.reset();
+
+    auto start = serviceContext->getServiceExecutor()->start();
+    if (!start.isOK()) {
+        error() << "Failed to start the service executor: " << start;
+        return EXIT_NET_ERROR;
+    }
+
+    start = serviceContext->getServiceEntryPoint()->start();
+    if (!start.isOK()) {
+        error() << "Failed to start the service entry point: " << start;
+        return EXIT_NET_ERROR;
+    }
+
+    if (!storageGlobalParams.repair) {
+        start = serviceContext->getTransportLayer()->start();
+        if (!start.isOK()) {
+            error() << "Failed to start the listener: " << start.toString();
+            return EXIT_NET_ERROR;
         }
-        else {
-            startTTLBackgroundJob();
-        }
+    }
+
+    serviceContext->notifyStartupComplete();
 
 #ifndef _WIN32
-        mongo::signalForkSuccess();
-#endif
-
-        if(getGlobalAuthorizationManager()->isAuthEnabled()) {
-            // open admin db in case we need to use it later. TODO this is not the right way to
-            // resolve this.
-            Client::WriteContext c("admin", storageGlobalParams.dbpath);
-        }
-
-        authindex::configureSystemIndexes("admin");
-
-        getDeleter()->startWorkers();
-
-        // Starts a background thread that rebuilds all incomplete indices. 
-        indexRebuilder.go(); 
-
-        listen(listenPort);
-
-        // listen() will return when exit code closes its socket.
-        exitCleanly(EXIT_NET_ERROR);
-    }
-
-    void initAndListen(int listenPort) {
-        try {
-            _initAndListen(listenPort);
-        }
-        catch ( DBException &e ) {
-            log() << "exception in initAndListen: " << e.toString() << ", terminating" << endl;
-            dbexit( EXIT_UNCAUGHT );
-        }
-        catch ( std::exception &e ) {
-            log() << "exception in initAndListen std::exception: " << e.what() << ", terminating" << endl;
-            dbexit( EXIT_UNCAUGHT );
-        }
-        catch ( int& n ) {
-            log() << "exception in initAndListen int: " << n << ", terminating" << endl;
-            dbexit( EXIT_UNCAUGHT );
-        }
-        catch(...) {
-            log() << "exception in initAndListen, terminating" << endl;
-            dbexit( EXIT_UNCAUGHT );
-        }
-    }
-
-#if defined(_WIN32)
-    void initService() {
-        ntservice::reportStatus( SERVICE_RUNNING );
-        log() << "Service running" << endl;
-        initAndListen(serverGlobalParams.port);
-    }
-#endif
-
-} // namespace mongo
-
-using namespace mongo;
-
-static int mongoDbMain(int argc, char* argv[], char** envp);
-
-#if defined(_WIN32)
-// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
-// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
-// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
-// and makes them available through the argv() and envp() members.  This enables mongoDbMain()
-// to process UTF-8 encoded arguments and environment variables without regard to platform.
-int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
-    WindowsCommandLine wcl(argc, argvW, envpW);
-    int exitCode = mongoDbMain(argc, wcl.argv(), wcl.envp());
-    ::_exit(exitCode);
-}
+    mongo::signalForkSuccess();
 #else
-int main(int argc, char* argv[], char** envp) {
-    int exitCode = mongoDbMain(argc, argv, envp);
-    ::_exit(exitCode);
+    if (ntservice::shouldStartService()) {
+        ntservice::reportStatus(SERVICE_RUNNING);
+        log() << "Service running";
+    }
+#endif
+
+    if (MONGO_FAIL_POINT(shutdownAtStartup)) {
+        log() << "starting clean exit via failpoint";
+        exitCleanly(EXIT_CLEAN);
+    }
+
+    MONGO_IDLE_THREAD_BLOCK;
+    return waitForShutdown();
+}
+
+ExitCode initAndListen(int listenPort) {
+    try {
+        return _initAndListen(listenPort);
+    } catch (DBException& e) {
+        log() << "exception in initAndListen: " << e.toString() << ", terminating";
+        return EXIT_UNCAUGHT;
+    } catch (std::exception& e) {
+        log() << "exception in initAndListen std::exception: " << e.what() << ", terminating";
+        return EXIT_UNCAUGHT;
+    } catch (int& n) {
+        log() << "exception in initAndListen int: " << n << ", terminating";
+        return EXIT_UNCAUGHT;
+    } catch (...) {
+        log() << "exception in initAndListen, terminating";
+        return EXIT_UNCAUGHT;
+    }
+}
+
+#if defined(_WIN32)
+ExitCode initService() {
+    return initAndListen(serverGlobalParams.port);
 }
 #endif
 
-MONGO_INITIALIZER_GENERAL(ForkServer,
-                          ("EndStartupOptionHandling"),
-                          ("default"))(InitializerContext* context) {
+MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
+(InitializerContext* context) {
     mongo::forkServerOrDie();
     return Status::OK();
 }
 
 /*
- * This function should contain the startup "actions" that we take based on the startup config.  It
- * is intended to separate the actions from "storage" and "validation" of our startup configuration.
+ * This function should contain the startup "actions" that we take based on the startup config.
+ * It is intended to separate the actions from "storage" and "validation" of our startup
+ * configuration.
  */
-static void startupConfigActions(const std::vector<std::string>& args) {
+void startupConfigActions(const std::vector<std::string>& args) {
     // The "command" option is deprecated.  For backward compatibility, still support the "run"
     // and "dbppath" command.  The "run" command is the same as just running mongod, so just
     // falls through.
     if (moe::startupOptionsParsed.count("command")) {
-        vector<string> command = moe::startupOptionsParsed["command"].as< vector<string> >();
+        const auto command = moe::startupOptionsParsed["command"].as<std::vector<std::string>>();
 
         if (command[0].compare("dbpath") == 0) {
-            cout << storageGlobalParams.dbpath << endl;
-            ::_exit(EXIT_SUCCESS);
+            std::cout << storageGlobalParams.dbpath << endl;
+            quickExit(EXIT_SUCCESS);
         }
 
         if (command[0].compare("run") != 0) {
-            cout << "Invalid command: " << command[0] << endl;
+            std::cout << "Invalid command: " << command[0] << endl;
             printMongodHelp(moe::startupOptions);
-            ::_exit(EXIT_FAILURE);
+            quickExit(EXIT_FAILURE);
         }
 
         if (command.size() > 1) {
-            cout << "Too many parameters to 'run' command" << endl;
+            std::cout << "Too many parameters to 'run' command" << endl;
             printMongodHelp(moe::startupOptions);
-            ::_exit(EXIT_FAILURE);
+            quickExit(EXIT_FAILURE);
         }
     }
 
 #ifdef _WIN32
     ntservice::configureService(initService,
-            moe::startupOptionsParsed,
-            defaultServiceStrings,
-            std::vector<std::string>(),
-            args);
+                                moe::startupOptionsParsed,
+                                defaultServiceStrings,
+                                std::vector<std::string>(),
+                                args);
 #endif  // _WIN32
 
 #ifdef __linux__
-    if (moe::startupOptionsParsed.count("shutdown")){
+    if (moe::startupOptionsParsed.count("shutdown") &&
+        moe::startupOptionsParsed["shutdown"].as<bool>() == true) {
         bool failed = false;
 
-        string name = (boost::filesystem::path(storageGlobalParams.dbpath) / "mongod.lock").string();
-        if ( !boost::filesystem::exists( name ) || boost::filesystem::file_size( name ) == 0 )
+        std::string name =
+            (boost::filesystem::path(storageGlobalParams.dbpath) / kLockFileBasename.toString())
+                .string();
+        if (!boost::filesystem::exists(name) || boost::filesystem::file_size(name) == 0)
             failed = true;
 
         pid_t pid;
-        string procPath;
-        if (!failed){
+        std::string procPath;
+        if (!failed) {
             try {
-                ifstream f (name.c_str());
+                std::ifstream f(name.c_str());
                 f >> pid;
                 procPath = (str::stream() << "/proc/" << pid);
                 if (!boost::filesystem::exists(procPath))
                     failed = true;
-            }
-            catch (const std::exception& e){
-                cerr << "Error reading pid from lock file [" << name << "]: " << e.what() << endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Error reading pid from lock file [" << name << "]: " << e.what()
+                          << endl;
                 failed = true;
             }
         }
@@ -895,85 +772,308 @@ static void startupConfigActions(const std::vector<std::string>& args) {
         if (failed) {
             std::cerr << "There doesn't seem to be a server running with dbpath: "
                       << storageGlobalParams.dbpath << std::endl;
-            ::_exit(EXIT_FAILURE);
+            quickExit(EXIT_FAILURE);
         }
 
-        cout << "killing process with pid: " << pid << endl;
+        std::cout << "killing process with pid: " << pid << endl;
         int ret = kill(pid, SIGTERM);
         if (ret) {
             int e = errno;
-            cerr << "failed to kill process: " << errnoWithDescription(e) << endl;
-            ::_exit(EXIT_FAILURE);
+            std::cerr << "failed to kill process: " << errnoWithDescription(e) << endl;
+            quickExit(EXIT_FAILURE);
         }
 
         while (boost::filesystem::exists(procPath)) {
             sleepsecs(1);
         }
 
-        ::_exit(EXIT_SUCCESS);
+        quickExit(EXIT_SUCCESS);
     }
 #endif
 }
 
-MONGO_INITIALIZER_GENERAL(CreateAuthorizationManager,
-                          ("SetupInternalSecurityUser"),
-                          MONGO_NO_DEPENDENTS)
-        (InitializerContext* context) {
-    AuthorizationManager* authzManager =
-            new AuthorizationManager(new AuthzManagerExternalStateMongod());
-    setGlobalAuthorizationManager(authzManager);
-    return Status::OK();
+void setUpCatalog(ServiceContext* serviceContext) {
+    DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
 }
 
-#ifdef MONGO_SSL
-MONGO_INITIALIZER_GENERAL(setSSLManagerType, 
-                          MONGO_NO_PREREQUISITES, 
-                          ("SSLManager"))(InitializerContext* context) {
+auto makeReplicationExecutor(ServiceContext* serviceContext) {
+    ThreadPool::Options tpOptions;
+    tpOptions.poolName = "replexec";
+    tpOptions.maxThreads = 50;
+    tpOptions.onCreateThread = [](const std::string& threadName) {
+        Client::initThread(threadName.c_str());
+    };
+    auto hookList = stdx::make_unique<rpc::EgressMetadataHookList>();
+    hookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
+    return stdx::make_unique<executor::ThreadPoolTaskExecutor>(
+        stdx::make_unique<ThreadPool>(tpOptions),
+        executor::makeNetworkInterface("Replication", nullptr, std::move(hookList)));
+}
+
+void setUpReplication(ServiceContext* serviceContext) {
+    repl::StorageInterface::set(serviceContext, stdx::make_unique<repl::StorageInterfaceImpl>());
+    auto storageInterface = repl::StorageInterface::get(serviceContext);
+
+    auto consistencyMarkers =
+        stdx::make_unique<repl::ReplicationConsistencyMarkersImpl>(storageInterface);
+    auto recovery = stdx::make_unique<repl::ReplicationRecoveryImpl>(storageInterface,
+                                                                     consistencyMarkers.get());
+    repl::ReplicationProcess::set(
+        serviceContext,
+        stdx::make_unique<repl::ReplicationProcess>(
+            storageInterface, std::move(consistencyMarkers), std::move(recovery)));
+    auto replicationProcess = repl::ReplicationProcess::get(serviceContext);
+
+    repl::DropPendingCollectionReaper::set(
+        serviceContext, stdx::make_unique<repl::DropPendingCollectionReaper>(storageInterface));
+    auto dropPendingCollectionReaper = repl::DropPendingCollectionReaper::get(serviceContext);
+
+    repl::TopologyCoordinator::Options topoCoordOptions;
+    topoCoordOptions.maxSyncSourceLagSecs = Seconds(repl::maxSyncSourceLagSecs);
+    topoCoordOptions.clusterRole = serverGlobalParams.clusterRole;
+
+    auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
+    LogicalClock::set(serviceContext, std::move(logicalClock));
+
+    auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorImpl>(
+        serviceContext,
+        getGlobalReplSettings(),
+        stdx::make_unique<repl::ReplicationCoordinatorExternalStateImpl>(
+            serviceContext, dropPendingCollectionReaper, storageInterface, replicationProcess),
+        makeReplicationExecutor(serviceContext),
+        stdx::make_unique<repl::TopologyCoordinator>(topoCoordOptions),
+        replicationProcess,
+        storageInterface,
+        SecureRandom::create()->nextInt64());
+    repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
+    repl::setOplogCollectionName(serviceContext);
+
+    IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
+}
+
+#ifdef MONGO_CONFIG_SSL
+MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManager"))
+(InitializerContext* context) {
     isSSLServer = true;
     return Status::OK();
 }
 #endif
 
-static int mongoDbMain(int argc, char* argv[], char **envp) {
-    static StaticObserver staticObserver;
+#if !defined(__has_feature)
+#define __has_feature(x) 0
+#endif
 
-    getcurns = ourgetns;
+// NOTE: This function may be called at any time after registerShutdownTask is called below. It
+// must not depend on the prior execution of mongo initializers or the existence of threads.
+void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
+    // This client initiation pattern is only to be used here, with plans to eliminate this pattern
+    // down the line.
+    if (!haveClient())
+        Client::initThread(getThreadName());
 
-    setupSignalHandlers();
+    auto const client = Client::getCurrent();
+    auto const serviceContext = client->getServiceContext();
 
-    dbExecCommand = argv[0];
+    // If we don't have shutdownArgs, we're shutting down from a signal, or other clean shutdown
+    // path.
+    //
+    // In that case, do a default step down, still shutting down if stepDown fails.
+    if (auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
+        replCoord && !shutdownArgs.isUserInitiated) {
+        replCoord->enterTerminalShutdown();
+        ServiceContext::UniqueOperationContext uniqueOpCtx;
+        OperationContext* opCtx = client->getOperationContext();
+        if (!opCtx) {
+            uniqueOpCtx = client->makeOperationContext();
+            opCtx = uniqueOpCtx.get();
+        }
 
-    srand(curTimeMicros());
+        try {
+            // For faster tests, we allow a short wait time with setParameter.
+            auto waitTime = repl::waitForStepDownOnNonCommandShutdown.load()
+                ? Milliseconds(Seconds(10))
+                : Milliseconds(100);
 
-    {
-        unsigned x = 0x12345678;
-        unsigned char& b = (unsigned char&) x;
-        if ( b != 0x78 ) {
-            out() << "big endian cpus not yet supported" << endl;
-            return 33;
+            replCoord->stepDown(opCtx, false /* force */, waitTime, Seconds(120));
+        } catch (const ExceptionFor<ErrorCodes::NotMaster>&) {
+            // ignore not master errors
+        } catch (const DBException& e) {
+            log() << "Failed to stepDown in non-command initiated shutdown path " << e.toString();
         }
     }
 
-    if( argc == 1 )
-        cout << dbExecCommand << " --help for help and startup options" << endl;
+    // Terminate the balancer thread so it doesn't leak memory.
+    if (auto balancer = Balancer::get(serviceContext)) {
+        balancer->interruptBalancer();
+        balancer->waitForBalancerToStop();
+    }
+
+    // Join the logical session cache before the transport layer.
+    if (auto lsc = LogicalSessionCache::get(serviceContext)) {
+        lsc->joinOnShutDown();
+    }
+
+    // Shutdown the TransportLayer so that new connections aren't accepted
+    if (auto tl = serviceContext->getTransportLayer()) {
+        log(LogComponent::kNetwork) << "shutdown: going to close listening sockets...";
+        tl->shutdown();
+    }
+
+    // Shut down the global dbclient pool so callers stop waiting for connections.
+    globalConnPool.shutdown();
+
+    // Shut down the background periodic task runner. This must be done before shutting down the
+    // storage engine.
+    if (auto runner = serviceContext->getPeriodicRunner()) {
+        runner->shutdown();
+    }
+
+    if (serviceContext->getStorageEngine()) {
+        ServiceContext::UniqueOperationContext uniqueOpCtx;
+        OperationContext* opCtx = client->getOperationContext();
+        if (!opCtx) {
+            uniqueOpCtx = client->makeOperationContext();
+            opCtx = uniqueOpCtx.get();
+        }
+        opCtx->setIsExecutingShutdown();
+
+        // This can wait a long time while we drain the secondary's apply queue, especially if
+        // it is building an index.
+        repl::ReplicationCoordinator::get(serviceContext)->shutdown(opCtx);
+
+        ShardingInitializationMongoD::get(serviceContext)->shutDown(opCtx);
+
+        // Acquire the RSTL in mode X. First we enqueue the lock request, then kill all operations,
+        // destroy all stashed transaction resources in order to release locks, and finally wait
+        // until the lock request is granted.
+        repl::ReplicationStateTransitionLockGuard rstl(
+            opCtx, MODE_X, repl::ReplicationStateTransitionLockGuard::EnqueueOnly());
+
+        // Kill all operations. After this point, the opCtx will have been marked as killed and will
+        // not be usable other than to kill all transactions directly below.
+        serviceContext->setKillAllOperations();
+
+        // Destroy all stashed transaction resources, in order to release locks.
+        killSessionsLocalShutdownAllTransactions(opCtx);
+
+        rstl.waitForLockUntil(Date_t::max());
+    }
+
+    // Shuts down the thread pool and waits for index builds to finish.
+    // Depends on setKillAllOperations() above to interrupt the index build operations.
+    IndexBuildsCoordinator::get(serviceContext)->shutdown();
+
+    ReplicaSetMonitor::shutdown();
+
+    if (auto sr = Grid::get(serviceContext)->shardRegistry()) {
+        sr->shutdown();
+    }
+
+    // Validator shutdown must be called after setKillAllOperations is called. Otherwise, this can
+    // deadlock.
+    if (auto validator = LogicalTimeValidator::get(serviceContext)) {
+        validator->shutDown();
+    }
+
+#if __has_feature(address_sanitizer)
+    // When running under address sanitizer, we get false positive leaks due to disorder around
+    // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
+    // harder to dry up the server from active connections before going on to really shut down.
+
+    // Shutdown the Service Entry Point and its sessions and give it a grace period to complete.
+    if (auto sep = serviceContext->getServiceEntryPoint()) {
+        if (!sep->shutdown(Seconds(10))) {
+            log(LogComponent::kNetwork)
+                << "Service entry point failed to shutdown within timelimit.";
+        }
+    }
+
+    // Shutdown and wait for the service executor to exit
+    if (auto svcExec = serviceContext->getServiceExecutor()) {
+        Status status = svcExec->shutdown(Seconds(10));
+        if (!status.isOK()) {
+            log(LogComponent::kNetwork) << "Service executor failed to shutdown within timelimit: "
+                                        << status.reason();
+        }
+    }
+#endif
+    stopFreeMonitoring();
+
+    // Shutdown Full-Time Data Capture
+    stopMongoDFTDC();
+
+    HealthLog::get(serviceContext).shutdown();
+
+    // We should always be able to acquire the global lock at shutdown.
+    //
+    // TODO: This call chain uses the locker directly, because we do not want to start an
+    // operation context, which also instantiates a recovery unit. Also, using the
+    // lockGlobalBegin/lockGlobalComplete sequence, we avoid taking the flush lock.
+    //
+    // For a Windows service, dbexit does not call exit(), so we must leak the lock outside
+    // of this function to prevent any operations from running that need a lock.
+    //
+    LockerImpl* globalLocker = new LockerImpl();
+    LockResult result = globalLocker->lockGlobalBegin(MODE_X, Date_t::max());
+    if (result == LOCK_WAITING) {
+        globalLocker->lockGlobalComplete(Date_t::max());
+    }
+
+    // Global storage engine may not be started in all cases before we exit
+    if (serviceContext->getStorageEngine()) {
+        shutdownGlobalStorageEngineCleanly(serviceContext);
+    }
+
+    // We drop the scope cache because leak sanitizer can't see across the
+    // thread we use for proxying MozJS requests. Dropping the cache cleans up
+    // the memory and makes leak sanitizer happy.
+    ScriptEngine::dropScopeCache();
+
+    log(LogComponent::kControl) << "now exiting";
+
+    audit::logShutdown(client);
+}
+
+int mongoDbMain(int argc, char* argv[], char** envp) {
+    registerShutdownTask(shutdownTask);
+
+    setupSignalHandlers();
+
+    srand(static_cast<unsigned>(curTimeMicros64()));
 
     Status status = mongo::runGlobalInitializers(argc, argv, envp);
     if (!status.isOK()) {
-        severe() << "Failed global initialization: " << status;
-        ::_exit(EXIT_FAILURE);
+        severe(LogComponent::kControl) << "Failed global initialization: " << status;
+        quickExit(EXIT_FAILURE);
     }
+
+    try {
+        setGlobalServiceContext(ServiceContext::make());
+    } catch (...) {
+        auto cause = exceptionToStatus();
+        severe(LogComponent::kControl) << "Failed to create service context: " << redact(cause);
+        quickExit(EXIT_FAILURE);
+    }
+
+    auto service = getGlobalServiceContext();
+    setUpCatalog(service);
+    setUpReplication(service);
+    service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
+
+    ErrorExtraInfo::invariantHaveAllParsers();
 
     startupConfigActions(std::vector<std::string>(argv, argv + argc));
     cmdline_utils::censorArgvArray(argc, argv);
 
-    if (!initializeServerGlobalState())
-        ::_exit(EXIT_FAILURE);
+    if (!initializeServerGlobalState(service))
+        quickExit(EXIT_FAILURE);
 
-    // Per SERVER-7434, startSignalProcessingThread() must run after any forks
-    // (initializeServerGlobalState()) and before creation of any other threads.
+    if (!initializeServerSecurityGlobalState(service))
+        quickExit(EXIT_FAILURE);
+
+    // Per SERVER-7434, startSignalProcessingThread must run after any forks (i.e.
+    // initializeServerGlobalState) and before the creation of any other threads
     startSignalProcessingThread();
-
-    dataFileSync.go();
 
 #if defined(_WIN32)
     if (ntservice::shouldStartService()) {
@@ -983,250 +1083,28 @@ static int mongoDbMain(int argc, char* argv[], char **envp) {
 #endif
 
     StartupTest::runTests();
-    initAndListen(serverGlobalParams.port);
-    dbexit(EXIT_CLEAN);
+    ExitCode exitCode = initAndListen(serverGlobalParams.port);
+    exitCleanly(exitCode);
     return 0;
 }
 
-namespace mongo {
+}  // namespace
+}  // namespace mongo
 
-    string getDbContext();
-
-#undef out
-
-
-#if !defined(_WIN32)
-
-} // namespace mongo
-
-#include <signal.h>
-#include <string.h>
-
-namespace mongo {
-
-    void abruptQuit(int x) {
-        ostringstream ossSig;
-        ossSig << "Got signal: " << x << " (" << strsignal( x ) << ")." << endl;
-        rawOut( ossSig.str() );
-
-        /*
-        ostringstream ossOp;
-        ossOp << "Last op: " << currentOp.infoNoauth() << endl;
-        rawOut( ossOp.str() );
-        */
-
-        ostringstream oss;
-        oss << "Backtrace:" << endl;
-        printStackTrace( oss );
-        rawOut( oss.str() );
-
-        // Don't go through normal shutdown procedure. It may make things worse.
-        ::_exit(EXIT_ABRUPT);
-
-    }
-
-    void abruptQuitWithAddrSignal( int signal, siginfo_t *siginfo, void * ) {
-        ostringstream oss;
-        oss << "Invalid";
-        if ( signal == SIGSEGV || signal == SIGBUS ) {
-            oss << " access";
-        } else {
-            oss << " operation";
-        }
-        oss << " at address: " << siginfo->si_addr << " from thread: " << getThreadName() << endl;
-        rawOut( oss.str() );
-        abruptQuit( signal );
-    }
-
-    sigset_t asyncSignals;
-    // The signals in asyncSignals will be processed by this thread only, in order to
-    // ensure the db and log mutexes aren't held.
-    void signalProcessingThread() {
-        while (true) {
-            int actualSignal = 0;
-            int status = sigwait( &asyncSignals, &actualSignal );
-            fassert(16781, status == 0);
-            switch (actualSignal) {
-            case SIGUSR1:
-                // log rotate signal
-                fassert(16782, rotateLogs());
-                logProcessDetailsForLogRotate();
-                break;
-            default:
-                // interrupt/terminate signal
-                Client::initThread( "signalProcessingThread" );
-                log() << "got signal " << actualSignal << " (" << strsignal( actualSignal )
-                      << "), will terminate after current cmd ends" << endl;
-                exitCleanly( EXIT_CLEAN );
-                break;
-            }
-        }
-    }
-
-    // this will be called in certain c++ error cases, for example if there are two active
-    // exceptions
-    void myterminate() {
-        rawOut( "terminate() called, printing stack (if implemented for platform):" );
-        printStackTrace();
-        ::abort();
-    }
-
-    // this gets called when new fails to allocate memory
-    void my_new_handler() {
-        rawOut( "out of memory, printing stack and exiting:" );
-        printStackTrace();
-        ::_exit(EXIT_ABRUPT);
-    }
-
-    void setupSignals_ignoreHelper( int signal ) {}
-
-    void setupSignalHandlers() {
-        setupCoreSignals();
-
-        struct sigaction addrSignals;
-        memset( &addrSignals, 0, sizeof( struct sigaction ) );
-        addrSignals.sa_sigaction = abruptQuitWithAddrSignal;
-        sigemptyset( &addrSignals.sa_mask );
-        addrSignals.sa_flags = SA_SIGINFO;
-
-        verify( sigaction(SIGSEGV, &addrSignals, 0) == 0 );
-        verify( sigaction(SIGBUS, &addrSignals, 0) == 0 );
-        verify( sigaction(SIGILL, &addrSignals, 0) == 0 );
-        verify( sigaction(SIGFPE, &addrSignals, 0) == 0 );
-
-        verify( signal(SIGABRT, abruptQuit) != SIG_ERR );
-        verify( signal(SIGQUIT, abruptQuit) != SIG_ERR );
-        verify( signal(SIGPIPE, SIG_IGN) != SIG_ERR );
-
-        setupSIGTRAPforGDB();
-
-        // asyncSignals is a global variable listing the signals that should be handled by the
-        // interrupt thread, once it is started via startSignalProcessingThread().
-        sigemptyset( &asyncSignals );
-        sigaddset( &asyncSignals, SIGHUP );
-        sigaddset( &asyncSignals, SIGINT );
-        sigaddset( &asyncSignals, SIGTERM );
-        sigaddset( &asyncSignals, SIGUSR1 );
-        sigaddset( &asyncSignals, SIGXCPU );
-
-        set_terminate( myterminate );
-        set_new_handler( my_new_handler );
-    }
-
-    void startSignalProcessingThread() {
-        verify( pthread_sigmask( SIG_SETMASK, &asyncSignals, 0 ) == 0 );
-        boost::thread it( signalProcessingThread );
-    }
-
-#else   // WIN32
-    void consoleTerminate( const char* controlCodeName ) {
-        Client::initThread( "consoleTerminate" );
-        log() << "got " << controlCodeName << ", will terminate after current cmd ends" << endl;
-        exitCleanly( EXIT_KILL );
-    }
-
-    BOOL WINAPI CtrlHandler( DWORD fdwCtrlType ) {
-
-        switch( fdwCtrlType ) {
-
-        case CTRL_C_EVENT:
-            rawOut( "Ctrl-C signal" );
-            consoleTerminate( "CTRL_C_EVENT" );
-            return TRUE ;
-
-        case CTRL_CLOSE_EVENT:
-            rawOut( "CTRL_CLOSE_EVENT signal" );
-            consoleTerminate( "CTRL_CLOSE_EVENT" );
-            return TRUE ;
-
-        case CTRL_BREAK_EVENT:
-            rawOut( "CTRL_BREAK_EVENT signal" );
-            consoleTerminate( "CTRL_BREAK_EVENT" );
-            return TRUE;
-
-        case CTRL_LOGOFF_EVENT:
-            // only sent to services, and only in pre-Vista Windows; FALSE means ignore
-            return FALSE;
-
-        case CTRL_SHUTDOWN_EVENT:
-            rawOut( "CTRL_SHUTDOWN_EVENT signal" );
-            consoleTerminate( "CTRL_SHUTDOWN_EVENT" );
-            return TRUE;
-
-        default:
-            return FALSE;
-        }
-    }
-
-    // called by mongoAbort()
-    extern void (*reportEventToSystem)(const char *msg);
-    void reportEventToSystemImpl(const char *msg) {
-        static ::HANDLE hEventLog = RegisterEventSource( NULL, TEXT("mongod") );
-        if( hEventLog ) {
-            std::wstring s = toNativeString(msg);
-            LPCTSTR txt = s.c_str();
-            BOOL ok = ReportEvent(
-              hEventLog, EVENTLOG_ERROR_TYPE,
-              0, 0, NULL,
-              1,
-              0,
-              &txt,
-              0);
-            wassert(ok);
-        }
-    }
-
-    void myPurecallHandler() {
-        printStackTrace();
-        mongoAbort("pure virtual");
-    }
-
-    void setupSignalHandlers() {
-        reportEventToSystem = reportEventToSystemImpl;
-        setWindowsUnhandledExceptionFilter();
-        massert(10297,
-                "Couldn't register Windows Ctrl-C handler",
-                SetConsoleCtrlHandler(static_cast<PHANDLER_ROUTINE>(CtrlHandler), TRUE));
-        _set_purecall_handler( myPurecallHandler );
-    }
-
-    void eventProcessingThread() {
-        std::string eventName = getShutdownSignalName(ProcessId::getCurrent().asUInt32());
-
-        HANDLE event = CreateEventA(NULL, TRUE, FALSE, eventName.c_str());
-        if (event == NULL) {
-            warning() << "eventProcessingThread CreateEvent failed: "
-                << errnoWithDescription();
-            return;
-        }
-
-        ON_BLOCK_EXIT(CloseHandle, event);
-
-        int returnCode = WaitForSingleObject(event, INFINITE);
-        if (returnCode != WAIT_OBJECT_0) {
-            if (returnCode == WAIT_FAILED) {
-                warning() << "eventProcessingThread WaitForSingleObject failed: "
-                    << errnoWithDescription();
-                return;
-            }
-            else {
-                warning() << "eventProcessingThread WaitForSingleObject failed: "
-                    << errnoWithDescription(returnCode);
-                return;
-            }
-        }
-
-        Client::initThread("eventTerminate");
-        log() << "shutdown event signaled, will terminate after current cmd ends";
-        exitCleanly(EXIT_CLEAN);
-    }
-
-    void startSignalProcessingThread() {
-        if (Command::testCommandsEnabled) {
-            boost::thread it(eventProcessingThread);
-        }
-    }
-
-#endif  // if !defined(_WIN32)
-
-} // namespace mongo
+#if defined(_WIN32)
+// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
+// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
+// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
+// and makes them available through the argv() and envp() members.  This enables mongoDbMain()
+// to process UTF-8 encoded arguments and environment variables without regard to platform.
+int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
+    mongo::WindowsCommandLine wcl(argc, argvW, envpW);
+    int exitCode = mongo::mongoDbMain(argc, wcl.argv(), wcl.envp());
+    mongo::quickExit(exitCode);
+}
+#else
+int main(int argc, char* argv[], char** envp) {
+    int exitCode = mongo::mongoDbMain(argc, argv, envp);
+    mongo::quickExit(exitCode);
+}
+#endif

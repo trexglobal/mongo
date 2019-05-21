@@ -1,6 +1,6 @@
 %define name    mongodb
-%define version 2.6.0-rc1
-%define release %mkrel 1
+%define version %{dynamic_version}
+%define release %{dynamic_release}
 
 Name:    %{name}
 Version: %{version}
@@ -91,9 +91,9 @@ scons --prefix=$RPM_BUILD_ROOT/usr all
 scons --prefix=$RPM_BUILD_ROOT%{_usr} install
 mkdir -p $RPM_BUILD_ROOT%{_mandir}/man1
 cp debian/*.1 $RPM_BUILD_ROOT%{_mandir}/man1/
-mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/rc.d/init.d
-cp rpm/init.d-mongod $RPM_BUILD_ROOT%{_sysconfdir}/rc.d/init.d/mongod
-chmod a+x $RPM_BUILD_ROOT%{_sysconfdir}/rc.d/init.d/mongod
+mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/init.d
+cp rpm/init.d-mongod $RPM_BUILD_ROOT%{_sysconfdir}/init.d/mongod
+chmod a+x $RPM_BUILD_ROOT%{_sysconfdir}/init.d/mongod
 mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}
 cp rpm/mongod.conf $RPM_BUILD_ROOT%{_sysconfdir}/mongod.conf
 mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig
@@ -130,8 +130,9 @@ fi
 
 %files
 %defattr(-,root,root,-)
-%doc README GNU-AGPL-3.0.txt
+%doc README
 
+%{_bindir}/install_compass
 %{_bindir}/mongo
 %{_bindir}/mongodump
 %{_bindir}/mongoexport
@@ -146,7 +147,6 @@ fi
 %{_mandir}/man1/mongoexport.1*
 %{_mandir}/man1/mongofiles.1*
 %{_mandir}/man1/mongoimport.1*
-%{_mandir}/man1/mongosniff.1*
 %{_mandir}/man1/mongostat.1*
 %{_mandir}/man1/mongorestore.1*
 
@@ -156,7 +156,7 @@ fi
 %{_bindir}/mongod
 %{_bindir}/mongos
 %{_mandir}/man1/mongos.1*
-%{_sysconfdir}/rc.d/init.d/mongod
+%{_sysconfdir}/init.d/mongod
 %{_sysconfdir}/sysconfig/mongod
 %attr(0755,mongod,mongod) %dir %{_var}/lib/mongo
 %attr(0755,mongod,mongod) %dir %{_var}/log/mongo

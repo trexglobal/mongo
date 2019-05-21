@@ -1,50 +1,47 @@
 /**
 * this tests some of the ground work
 */
+(function() {
+    'use strict';
 
-s = new ShardingTest( "shard1" , 2 );
+    var s = new ShardingTest({shards: 2});
+    var db = s.getDB("test");
 
-db = s.getDB( "test" );
-db.foo.insert( { num : 1 , name : "eliot" } );
-db.foo.insert( { num : 2 , name : "sara" } );
-db.foo.insert( { num : -1 , name : "joe" } );
-db.foo.ensureIndex( { num : 1 } );
-assert.eq( 3 , db.foo.find().length() , "A" );
+    assert.writeOK(db.foo.insert({num: 1, name: "eliot"}));
+    assert.writeOK(db.foo.insert({num: 2, name: "sara"}));
+    assert.writeOK(db.foo.insert({num: -1, name: "joe"}));
 
-shardCommand = { shardcollection : "test.foo" , key : { num : 1 } };
+    assert.commandWorked(db.foo.ensureIndex({num: 1}));
 
-assert.throws( function(){ s.adminCommand( shardCommand ); } );
+    assert.eq(3, db.foo.find().length(), "A");
 
-s.adminCommand( { enablesharding : "test" } );
-assert.eq( 3 , db.foo.find().length() , "after partitioning count failed" );
+    const shardCommand = {shardcollection: "test.foo", key: {num: 1}};
 
-s.adminCommand( shardCommand );
+    assert.commandFailed(s.s0.adminCommand(shardCommand));
 
-assert.throws( function(){ s.adminCommand({ shardCollection: 'test', key: { x: 1 }}); });
-assert.throws( function(){ s.adminCommand({ shardCollection: '.foo', key: { x: 1 }}); });
+    assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
+    s.ensurePrimaryShard('test', s.shard1.shardName);
 
-cconfig = s.config.collections.findOne( { _id : "test.foo" } );
-assert( cconfig , "why no collection entry for test.foo" )
-delete cconfig.lastmod
-delete cconfig.dropped
-delete cconfig.lastmodEpoch
-assert.eq( cconfig , { _id : "test.foo" , key : { num : 1 } , unique : false } , "Sharded content" );
+    assert.eq(3, db.foo.find().length(), "after partitioning count failed");
 
-s.config.collections.find().forEach( printjson )
+    assert.commandWorked(s.s0.adminCommand(shardCommand));
+    assert.commandFailed(s.s0.adminCommand({shardCollection: 'test', key: {x: 1}}));
+    assert.commandFailed(s.s0.adminCommand({shardCollection: '.foo', key: {x: 1}}));
 
-assert.eq( 1 , s.config.chunks.count() , "num chunks A");
-si = s.config.chunks.findOne();
-assert( si );
-assert.eq( si.ns , "test.foo" );
+    var cconfig = s.config.collections.findOne({_id: "test.foo"});
+    assert(cconfig, "No collection entry found for test.foo");
 
-assert.eq( 3 , db.foo.find().length() , "after sharding, no split count failed" );
+    delete cconfig.lastmod;
+    delete cconfig.dropped;
+    delete cconfig.lastmodEpoch;
+    delete cconfig.uuid;
 
-// SERVER-4284, test modified because of SERVER-5020
-var invalidDB = s.getDB( "foobar" );
-// hack to bypass invalid database name checking at the DB constructor
-invalidDB._name = "foo bar";
-invalidDB.blah.insert( { x : 1 } );
-assert.isnull( s.config.databases.findOne( { _id : "foo bar" } ) );
+    assert.eq(cconfig, {_id: "test.foo", key: {num: 1}, unique: false}, "Sharded content mismatch");
 
+    s.config.collections.find().forEach(printjson);
 
-s.stop();
+    assert.eq(1, s.config.chunks.count({"ns": "test.foo"}), "num chunks A");
+    assert.eq(3, db.foo.find().length(), "after sharding, no split count failed");
+
+    s.stop();
+})();

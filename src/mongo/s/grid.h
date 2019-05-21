@@ -1,164 +1,203 @@
-// grid.h
-
 /**
-*    Copyright (C) 2010 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include <boost/date_time/posix_time/posix_time.hpp>
-
-#include "mongo/util/time_support.h"
-#include "mongo/util/concurrency/mutex.h"
-
-#include "config.h"  // DBConfigPtr
+#include "mongo/db/repl/optime.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/stdx/functional.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
+class BalancerConfiguration;
+class ClusterCursorManager;
+class OperationContext;
+class ServiceContext;
+
+namespace executor {
+struct ConnectionPoolStats;
+class NetworkInterface;
+class TaskExecutorPool;
+}  // namespace executor
+
+/**
+ * Contains the sharding context for a running server. Exists on both MongoD and MongoS.
+ */
+class Grid {
+public:
+    Grid();
+    ~Grid();
+
+    using CustomConnectionPoolStatsFn = stdx::function<void(executor::ConnectionPoolStats* stats)>;
+
     /**
-     * stores meta-information about the grid
-     * TODO: used shard_ptr for DBConfig pointers
+     * Retrieves the instance of Grid associated with the current service/operation context.
      */
-    class Grid {
-    public:
-        Grid() : _lock( "Grid" ) , _allowLocalShard( true ) { }
+    static Grid* get(ServiceContext* serviceContext);
+    static Grid* get(OperationContext* operationContext);
 
-        /**
-         * gets the config the db.
-         * will return an empty DBConfig if not in db already
-         */
-        DBConfigPtr getDBConfig( const StringData& ns , bool create=true , const string& shardNameHint="" );
+    /**
+     * Called at startup time so the global sharding services can be set. This method must be called
+     * once and once only for the lifetime of the service.
+     *
+     * NOTE: Unit-tests are allowed to call it more than once, provided they reset the object's
+     *       state using clearForUnitTests.
+     */
+    void init(std::unique_ptr<ShardingCatalogClient> catalogClient,
+              std::unique_ptr<CatalogCache> catalogCache,
+              std::unique_ptr<ShardRegistry> shardRegistry,
+              std::unique_ptr<ClusterCursorManager> cursorManager,
+              std::unique_ptr<BalancerConfiguration> balancerConfig,
+              std::unique_ptr<executor::TaskExecutorPool> executorPool,
+              executor::NetworkInterface* network);
 
-        /**
-         * removes db entry.
-         * on next getDBConfig call will fetch from db
-         */
-        void removeDB( const std::string& db );
+    /**
+     * Used to check if sharding is initialized for usage of global sharding services. Protected by
+     * an atomic access guard.
+     */
+    bool isShardingInitialized() const;
 
-        /**
-         * removes db entry - only this DBConfig object will be removed,
-         *  other DBConfigs which may have been created in the meantime will not be harmed
-         *  on next getDBConfig call will fetch from db
-         *
-         *  Using this method avoids race conditions where multiple threads detect a database
-         *  reload has failed.
-         *
-         *  Example : N threads receive version exceptions and dbConfig.reload(), while
-         *  simultaneously a dropDatabase is occurring.  In the meantime, the dropDatabase call
-         *  attempts to create a DBConfig object if one does not exist, to load the db info,
-         *  but the config is repeatedly deleted as soon as it is created.  Using this method
-         *  prevents the deletion of configs we don't know about.
-         *
-         */
-        void removeDBIfExists( const DBConfig& database );
+    /**
+     * Used to indicate the sharding initialization process is complete. Should only be called once
+     * in the lifetime of a server. Protected by an atomic access guard.
+     */
+    void setShardingInitialized();
 
-        /**
-         * @return true if shards and config servers are allowed to use 'localhost' in address
-         */
-        bool allowLocalHost() const;
+    /**
+     * If the instance as which this sharding component is running (config/shard/mongos) uses
+     * additional connection pools other than the default, this function will be present and can be
+     * used to obtain statistics about them. Otherwise, the value will be unset.
+     */
+    CustomConnectionPoolStatsFn getCustomConnectionPoolStatsFn() const;
+    void setCustomConnectionPoolStatsFn(CustomConnectionPoolStatsFn statsFn);
 
-        /**
-         * @param whether to allow shards and config servers to use 'localhost' in address
-         */
-        void setAllowLocalHost( bool allow );
+    /**
+     * Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
+     * it can be deleted.
+     * @return true if shards and config servers are allowed to use 'localhost' in address
+     */
+    bool allowLocalHost() const;
 
-        /**
-         *
-         * addShard will create a new shard in the grid. It expects a mongod process to be running
-         * on the provided address. Adding a shard that is a replica set is supported.
-         *
-         * @param name is an optional string with the name of the shard. if omitted, grid will
-         *        generate one and update the parameter.
-         * @param servers is the connection string of the shard being added
-         * @param maxSize is the optional space quota in bytes. Zeros means there's no limitation to
-         *        space usage
-         * @param errMsg is the error description in case the operation failed.
-         * @return true if shard was successfully added.
-         */
-        bool addShard( string* name , const ConnectionString& servers , long long maxSize , string& errMsg );
+    /**
+     * Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
+     * it can be deleted.
+     * @param whether to allow shards and config servers to use 'localhost' in address
+     */
+    void setAllowLocalHost(bool allow);
 
-        /**
-         * @return true if the config database knows about a host 'name'
-         */
-        bool knowAboutShard( const string& name ) const;
+    ShardingCatalogClient* catalogClient() const {
+        return _catalogClient.get();
+    }
 
-        /**
-         * @return true if the chunk balancing functionality is enabled
-         */
-        bool shouldBalance( const string& ns = "", BSONObj* balancerDocOut = 0 ) const;
+    CatalogCache* catalogCache() const {
+        return _catalogCache.get();
+    }
 
-        /**
-         * 
-         * Obtain grid configuration and settings data.
-         *
-         * @param name identifies a particular type of configuration data.
-         * @return a BSON object containing the requested data.
-         */
-        BSONObj getConfigSetting( const std::string& name ) const;
+    ShardRegistry* shardRegistry() const {
+        return _shardRegistry.get();
+    }
 
-        unsigned long long getNextOpTime() const;
-        
-        void flushConfig();
+    ClusterCursorManager* getCursorManager() const {
+        return _cursorManager.get();
+    }
 
-        // exposed methods below are for testing only
+    executor::TaskExecutorPool* getExecutorPool() const {
+        return _executorPool.get();
+    }
 
-        /**
-         * @param balancerDoc bson that may contain a window of time for the balancer to work
-         *        format { ... , activeWindow: { start: "8:30" , stop: "19:00" } , ... }
-         * @return true if there is no window of time specified for the balancer or it we're currently in it
-         */
-        static bool _inBalancingWindow( const BSONObj& balancerDoc , const boost::posix_time::ptime& now );
+    executor::NetworkInterface* getNetwork() {
+        return _network;
+    }
 
-    private:
-        mongo::mutex              _lock;            // protects _databases; TODO: change to r/w lock ??
-        map<string, DBConfigPtr > _databases;       // maps ns to DBConfig's
-        bool                      _allowLocalShard; // can 'localhost' be used in shard addresses?
+    BalancerConfiguration* getBalancerConfiguration() const {
+        return _balancerConfig.get();
+    }
 
-        /**
-         * @param name is the chose name for the shard. Parameter is mandatory.
-         * @return true if it managed to generate a shard name. May return false if (currently)
-         * 10000 shard
-         */
-        bool _getNewShardName( string* name ) const;
+    /**
+     * Returns the the last optime that a shard or config server has reported as the current
+     * committed optime on the config server.
+     * NOTE: This is not valid to call on a config server instance.
+     */
+    repl::OpTime configOpTime() const;
 
-        /**
-         * @return whether a give dbname is used for shard "local" databases (e.g., admin or local)
-         */
-        static bool _isSpecialLocalDB( const string& dbName );
+    /**
+     * Called whenever a mongos or shard gets a response from a config server or shard and updates
+     * what we've seen as the last config server optime.
+     * NOTE: This is not valid to call on a config server instance.
+     */
+    void advanceConfigOpTime(repl::OpTime opTime);
 
-        /**
-         * @param balancerDoc bson that may contain a marker to stop the balancer
-         *        format { ... , stopped: [ "true" | "false" ] , ... }
-         * @return true if the marker is present and is set to true
-         */
-        static bool _balancerStopped( const BSONObj& balancerDoc );
+    /**
+     * Clears the grid object so that it can be reused between test executions. This will not
+     * be necessary if grid is hanging off the global ServiceContext and each test gets its
+     * own service context.
+     *
+     * Note: shardRegistry()->shutdown() must be called before this method is called.
+     *
+     * NOTE: Do not use this outside of unit-tests.
+     */
+    void clearForUnitTests();
 
-    };
+private:
+    std::unique_ptr<ShardingCatalogClient> _catalogClient;
+    std::unique_ptr<CatalogCache> _catalogCache;
+    std::unique_ptr<ShardRegistry> _shardRegistry;
+    std::unique_ptr<ClusterCursorManager> _cursorManager;
+    std::unique_ptr<BalancerConfiguration> _balancerConfig;
 
-    extern Grid grid;
+    // Executor pool for scheduling work and remote commands to shards and config servers. Each
+    // contained executor has a connection hook set on it for sending/receiving sharding metadata.
+    std::unique_ptr<executor::TaskExecutorPool> _executorPool;
 
-} // namespace mongo
+    // Network interface being used by the fixed executor in _executorPool.  Used for asking
+    // questions about the network configuration, such as getting the current server's hostname.
+    executor::NetworkInterface* _network{nullptr};
+
+    CustomConnectionPoolStatsFn _customConnectionPoolStatsFn;
+
+    AtomicWord<bool> _shardingInitialized{false};
+
+    // Protects _configOpTime.
+    mutable stdx::mutex _mutex;
+
+    // Last known highest opTime from the config server that should be used when doing reads.
+    // This value is updated any time a shard or mongos talks to a config server or a shard.
+    repl::OpTime _configOpTime;
+
+    // Deprecated. This is only used on mongos, and once addShard is solely handled by the configs,
+    // it can be deleted.
+    // Can 'localhost' be used in shard addresses?
+    bool _allowLocalShard{true};
+};
+
+}  // namespace mongo
