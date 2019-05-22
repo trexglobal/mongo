@@ -27,7 +27,7 @@ var (
 )
 
 const (
-	maximumDocumentSize = 49 * 1024 * 1024 // there is a 48MB max message size
+	maximumDocumentSize = 384 * 1024 * 1024 // there is a 48MB max message size
 )
 
 // AbbreviateBytes returns a reduced byte array of the given one if it's

@@ -15,7 +15,7 @@ import (
 	"github.com/10gen/llmgo/bson"
 )
 
-const maxBSONSize = 16 * 1024 * 1024 // 16MB - maximum BSON document size
+const maxBSONSize = 128 * 1024 * 1024 // 16MB - maximum BSON document size
 
 // RawOp may be exactly the same as OpUnknown.
 type RawOp struct {
