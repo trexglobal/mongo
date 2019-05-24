@@ -300,10 +300,9 @@ namespace {
 #if !(defined(_WIN32) || defined(__sunos__))
         // Parse hexadecimal representations of a double.  Hex literals not supported by MSVC, and
         // not parseable by the Windows SDK libc or the Solaris libc in the mode we build.
-
-        ASSERT_PARSES(double, "0xff", 0xff);
-        ASSERT_PARSES(double, "-0xff", -0xff);
-        ASSERT_PARSES(double, "0xabcab.defdefP-10", 0xabcab.defdefP-10);
+        ASSERT_PARSES(double, "0xff", 255);
+	ASSERT_PARSES(double, "-0xff", -255);
+	ASSERT_PARSES(double, "0xabcab.defdefP-10", 687.16784283419838);
 #endif
     }
 
