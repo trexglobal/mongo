@@ -43,8 +43,10 @@ class OperationContext;
 
 namespace dur {
 
+//  MONGO_STATIC_ASSERT(sizeof(void*) == 4 || UncommittedBytesLimit > BSONObjMaxInternalSize * 6);
+//  This needs to be increased because it must be greater than BSONObjMaxInternalSize
 // a smaller limit is likely better on 32 bit
-const unsigned UncommittedBytesLimit = (sizeof(void*) == 4) ? 50 * 1024 * 1024 : 512 * 1024 * 1024;
+const unsigned UncommittedBytesLimit = (sizeof(void*) == 4) ? 512 * 1024 * 1024 : 1024 * 1024 * 1024;
 
 class DurableInterface {
     MONGO_DISALLOW_COPYING(DurableInterface);

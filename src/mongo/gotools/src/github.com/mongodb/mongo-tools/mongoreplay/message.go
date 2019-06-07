@@ -15,7 +15,8 @@ import (
 const MsgHeaderLen = 16
 
 // MaxMessageSize is the maximum message size as defined in the server
-const MaxMessageSize = 48 * 1000 * 1000
+// TREX: Increase the value to 8 times of the original value. Message is the max size of message that will be allowed to send over the network.
+const MaxMessageSize = 384 * 1000 * 1000
 
 // MsgHeader is the mongo MessageHeader
 type MsgHeader struct {

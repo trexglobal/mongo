@@ -34,8 +34,9 @@ const (
 )
 
 // MongoDB enforced limits.
+// TREX: Increase mongo client bson document size to 8 times the original value. Original value is 16
 const (
-	MaxBSONSize = 16 * 1024 * 1024 // 16MB - maximum BSON document size
+	MaxBSONSize = 128 * 1024 * 1024 // 16MB - maximum BSON document size
 )
 
 // Default port for integration tests

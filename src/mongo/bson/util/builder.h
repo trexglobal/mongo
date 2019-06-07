@@ -66,7 +66,8 @@ namespace mongo {
      update $push (append) operation
      various db.eval() type operations
 */
-const int BSONObjMaxUserSize = 16 * 1024 * 1024;
+//TREX: Increased bson size to 8 times of the original value
+const int BSONObjMaxUserSize = 128 * 1024 * 1024;
 
 /*
    Sometimes we need objects slightly larger - an object in the replication local.oplog
@@ -74,7 +75,8 @@ const int BSONObjMaxUserSize = 16 * 1024 * 1024;
 */
 const int BSONObjMaxInternalSize = BSONObjMaxUserSize + (16 * 1024);
 
-const int BufferMaxSize = 64 * 1024 * 1024;
+//TREX: This value must be greater than BSONObjMaxUserSize, original value was 64
+const int BufferMaxSize = 512 * 1024 * 1024;
 
 template <typename Allocator>
 class StringBuilderImpl;

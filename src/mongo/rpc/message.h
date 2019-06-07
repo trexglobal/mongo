@@ -43,7 +43,8 @@ namespace mongo {
 /**
  * Maximum accepted message size on the wire protocol.
  */
-const size_t MaxMessageSizeBytes = 48 * 1000 * 1000;
+// TREX: Increase the message size to 8 times of the original value. It must be larger than bson size.
+const size_t MaxMessageSizeBytes = 384 * 1000 * 1000;
 
 enum NetworkOp : int32_t {
     opInvalid = 0,
